@@ -255,6 +255,12 @@ private:
     std::map<TalkerKey, std::unique_ptr<tsn::AvtpStream>> talkers_;
 
     /**
+     * Source of the unique ID half of a locally derived stream ID, handed out
+     * once per talker. Guarded by @ref output_mutex_.
+     */
+    uint16_t next_stream_unique_id_ = 1;
+
+    /**
      * Logical port announced as the source of outgoing messages. Set from the
      * first unicast input channel opened, which is the participant's
      * metatraffic unicast port.

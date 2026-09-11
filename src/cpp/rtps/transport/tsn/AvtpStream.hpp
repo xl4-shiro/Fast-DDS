@@ -68,6 +68,8 @@ struct AvtpStreamConfig
     MacAddress destination_mac{};
     //! IEEE 1722 stream ID. Ignored by listeners, which accept every stream ID reaching them.
     StreamId stream_id{};
+    //! Whether @ref stream_id came from the CNC rather than being derived locally.
+    bool stream_id_from_cnc = false;
     //! VLAN ID of the 802.1Q tag.
     uint16_t vlan_id = 0;
     //! Priority Code Point of the 802.1Q tag.

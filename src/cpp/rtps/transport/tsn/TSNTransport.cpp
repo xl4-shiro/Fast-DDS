@@ -323,10 +323,9 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
         config.pcp = configuration_.default_pcp;
     }
 
-    // The stream ID identifies this node's traffic: the local MAC address plus
-    // a unique ID, per subclause 7.3.3 of [DDS-TSN]. Without a provisioned
-    // stream, the RTPS logical port serves as that unique ID.
-    config.stream_id = tsn::make_stream_id(local_mac_, EthernetLocator::logical_port(locator));
+    // The stream ID is left for get_or_open_talker() to assign unless the CNC
+    // provisioned one: it has to be unique per stream on this node, which the
+    // destination locator alone cannot guarantee.
 
     if (talker && cnc_config_)
     {
@@ -335,6 +334,7 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
                 EthernetLocator::vid(locator), stream))
         {
             config.stream_id = stream.stream_id;
+            config.stream_id_from_cnc = true;
             config.vlan_id = stream.vlan_id;
             config.pcp = stream.pcp;
             config.socket_priority = stream.pcp;
@@ -392,7 +392,7 @@ bool TSNTransport::OpenOutputChannel(
 AvtpStream* TSNTransport::get_or_open_talker(
         const Locator& locator)
 {
-    const AvtpStreamConfig config = stream_config_for(locator, true);
+    AvtpStreamConfig config = stream_config_for(locator, true);
 
     TalkerKey key;
     key.destination_mac = config.destination_mac;
@@ -406,11 +406,29 @@ AvtpStream* TSNTransport::get_or_open_talker(
         return it->second.get();
     }
 
+    if (!config.stream_id_from_cnc)
+    {
+        // Subclause 7.3.3 of [DDS-TSN] builds a stream ID from the node's MAC
+        // address plus a unique ID that identifies the stream within the node.
+        // Each talker is a separate stream on the wire --- separate socket,
+        // separate AVTP sequence numbering --- so each needs its own ID.
+        // Deriving it from the destination's logical port would not do: every
+        // remote reader listens on the same default port, so two talkers would
+        // share one ID while numbering their frames independently, which is
+        // exactly what a stream ID is supposed to rule out.
+        config.stream_id = tsn::make_stream_id(local_mac_, next_stream_unique_id_++);
+    }
+
     std::unique_ptr<AvtpStream> stream = AvtpStream::open_talker(config);
     if (!stream)
     {
         return nullptr;
     }
+
+    EPROSIMA_LOG_INFO(TSN_TRANSPORT, "Talker to " << EthernetLocator::mac_to_string(locator)
+                                                  << " VLAN " << config.vlan_id
+                                                  << " PCP " << static_cast<int>(config.pcp)
+                                                  << " uses stream " << tsn::stream_id_to_string(config.stream_id));
 
     AvtpStream* raw = stream.get();
     talkers_.emplace(key, std::move(stream));
