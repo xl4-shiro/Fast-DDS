@@ -213,6 +213,7 @@ set(${PROJECT_NAME}_source_files
     ${FASTDDS_SOURCE_DIR}/statistics/fastdds/domain/DomainParticipant.cpp
     ${FASTDDS_SOURCE_DIR}/statistics/fastdds/publisher/qos/DataWriterQos.cpp
     ${FASTDDS_SOURCE_DIR}/statistics/fastdds/subscriber/qos/DataReaderQos.cpp
+    ${FASTDDS_SOURCE_DIR}/utils/EthernetLocator.cpp
     ${FASTDDS_SOURCE_DIR}/utils/Host.cpp
     ${FASTDDS_SOURCE_DIR}/utils/IPFinder.cpp
     ${FASTDDS_SOURCE_DIR}/utils/IPLocator.cpp
@@ -318,6 +319,26 @@ set(${PROJECT_NAME}_sqlite3_source_files
     ${FASTDDS_SOURCE_DIR}/rtps/persistence/SQLite3PersistenceService.cpp
     ${FASTDDS_SOURCE_DIR}/rtps/persistence/sqlite3.c
     )
+
+#DDS-TSN transport sources
+set(${PROJECT_NAME}_tsn_source_files
+    ${FASTDDS_SOURCE_DIR}/fastdds/tsn/TsnStreamLocators.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/AvtpStream.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/TsnCncConfig.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/TSNChannelResource.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/TSNTransport.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/TSNTransportDescriptor.cpp
+    ${FASTDDS_SOURCE_DIR}/rtps/transport/tsn/Xl4Runtime.cpp
+    )
+
+if(TSN_TRANSPORT)
+    list(APPEND ${PROJECT_NAME}_source_files
+        ${${PROJECT_NAME}_tsn_source_files}
+        )
+    set(HAVE_TSN_TRANSPORT 1)
+else()
+    set(HAVE_TSN_TRANSPORT 0)
+endif()
 
 if(SQLITE3_SUPPORT)
     list(APPEND ${PROJECT_NAME}_source_files

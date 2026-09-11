@@ -387,12 +387,23 @@ inline std::ostream& operator <<(
             break;
 
         case LOCATOR_KIND_ETHERNET:
+        {
+            // Restore the stream's formatting afterwards: leaving it in
+            // std::hex would print this locator's own port, and everything
+            // streamed after it, in hexadecimal.
+            std::ios_base::fmtflags saved_flags = output.flags();
+            char saved_fill = output.fill();
+
             output << std::hex << std::setfill('0') << std::setw(2) << (int)loc.address[10];
             for (int i = 1; i < 6; ++i)
             {
-                output << ":" << std::hex << std::setfill('0') << std::setw(2) << (int)loc.address[10 + i];
+                output << ":" << std::setw(2) << (int)loc.address[10 + i];
             }
+
+            output.flags(saved_flags);
+            output.fill(saved_fill);
             break;
+        }
 
         case LOCATOR_KIND_SHM:
             if (loc.address[0] == 'M')

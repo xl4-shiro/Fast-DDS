@@ -326,6 +326,56 @@ option(SQLITE3_SUPPORT "Activate SQLITE3 support" ON)
 option(SHM_TRANSPORT_DEFAULT "Add SHM transport to the default transports" ON)
 
 ###############################################################################
+# DDS-TSN transport (DDSI-RTPS Ethernet PSM over IEEE 1722)
+###############################################################################
+option(TSN_TRANSPORT "Activate the DDS-TSN transport (IEEE 1722 over Ethernet)" OFF)
+
+if(TSN_TRANSPORT)
+    if(NOT UNIX OR APPLE OR ANDROID OR QNX)
+        message(FATAL_ERROR "TSN_TRANSPORT needs Linux AF_PACKET raw sockets")
+    endif()
+
+    find_package(PkgConfig REQUIRED)
+    # xl4avtp pulls in xl4unibase, xl4combase and xl4gptp through its Requires.
+    pkg_check_modules(XL4AVTP REQUIRED IMPORTED_TARGET xl4avtp)
+    pkg_check_modules(XL4UNICONF REQUIRED IMPORTED_TARGET xl4uniconf)
+
+    # The ACF (AVTP Control Format) module ships inside xl4avtp. Its headers are
+    # reached through the xl4avtp include path, so only check that they are
+    # actually installed.
+    find_path(XL4ACF_INCLUDE_DIR
+        NAMES xl4avtp/acf/acf_serdes.h
+        HINTS ${XL4AVTP_INCLUDE_DIRS}
+        PATH_SUFFIXES xl4tsn
+        )
+    if(NOT XL4ACF_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "TSN_TRANSPORT needs the ACF module of xl4avtp (xl4avtp/acf/acf_serdes.h). "
+            "Rebuild and install xl4avtp, or point CMake at the headers with "
+            "-DXL4ACF_INCLUDE_DIR=...")
+    endif()
+
+    # xl4avtp.pc lists x4acf from version 1.0.2 on. Look the library up
+    # separately only when linking against an older install.
+    set(XL4ACF_EXTRA_LIBRARIES "")
+    if(NOT "x4acf" IN_LIST XL4AVTP_LINK_LIBRARIES AND NOT "x4acf" IN_LIST XL4AVTP_LIBRARIES)
+        find_library(XL4ACF_LIBRARY
+            NAMES x4acf
+            HINTS ${XL4AVTP_LIBRARY_DIRS}
+            )
+        if(NOT XL4ACF_LIBRARY)
+            message(FATAL_ERROR
+                "TSN_TRANSPORT needs libx4acf. It is not named in this xl4avtp.pc and was not found. "
+                "Rebuild and install xl4avtp, or point CMake at it with -DXL4ACF_LIBRARY=...")
+        endif()
+        set(XL4ACF_EXTRA_LIBRARIES ${XL4ACF_LIBRARY})
+        message(STATUS "xl4avtp.pc does not list x4acf; linking ${XL4ACF_LIBRARY} directly")
+    endif()
+
+    message(STATUS "DDS-TSN transport enabled (xl4avtp ${XL4AVTP_VERSION}, xl4uniconf ${XL4UNICONF_VERSION})")
+endif()
+
+###############################################################################
 # LogConsumer default setup
 ###############################################################################
 set(LOG_CONSUMER_DEFAULT AUTO CACHE STRING "Selects default LogConsumer")

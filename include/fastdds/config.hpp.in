@@ -63,6 +63,11 @@
 #define HAVE_SQLITE3 @HAVE_SQLITE3@
 #endif /* ifndef HAVE_SQLITE3 */
 
+// DDS-TSN transport (DDSI-RTPS Ethernet PSM over IEEE 1722)
+#ifndef HAVE_TSN_TRANSPORT
+#define HAVE_TSN_TRANSPORT @HAVE_TSN_TRANSPORT@
+#endif /* ifndef HAVE_TSN_TRANSPORT */
+
 // Using thirdparty shared_mutex
 #cmakedefine01 USE_THIRDPARTY_SHARED_MUTEX
 

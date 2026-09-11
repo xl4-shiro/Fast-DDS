@@ -1,0 +1,230 @@
+// Copyright (C) 2026 Excelfore Corporation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/**
+ * @file TSNTransportDescriptor.hpp
+ */
+
+#ifndef FASTDDS_RTPS_TRANSPORT__TSNTRANSPORTDESCRIPTOR_HPP
+#define FASTDDS_RTPS_TRANSPORT__TSNTRANSPORTDESCRIPTOR_HPP
+
+#include <cstdint>
+#include <string>
+
+#include <fastdds/fastdds_dll.hpp>
+#include <fastdds/rtps/transport/PortBasedTransportDescriptor.hpp>
+
+namespace eprosima {
+namespace fastdds {
+namespace rtps {
+
+class TransportInterface;
+
+/**
+ * Configuration of the DDS-TSN transport: the DDSI-RTPS Ethernet PSM
+ * (Annex A of [DDS-TSN], ptc/2023-03-03) carried over IEEE 1722 AVTP frames.
+ *
+ * The kind of the locators handled by this transport is
+ * eprosima::fastdds::rtps::LOCATOR_KIND_ETHERNET.
+ *
+ * Every RTPS message is the payload of exactly one Ethernet frame:
+ *
+ * @code
+ * [ Ethernet header | 802.1Q VLAN tag | EtherType 0x22F0 ]
+ * [ AVTP stream header: subtype=0x7F, sequence_num, stream_id,
+ *                       avtp_timestamp, stream_data_length ]
+ * [ destination logical port | source logical port | rtps_length ]
+ * [ RTPS message: Header + Submessages ]
+ * @endcode
+ *
+ * Setting @ref avtp_subtype to a control format (NTSCF 0x82 or TSCF 0x06)
+ * instead wraps the same payload in an ACF message of type
+ * @ref acf_message_type, which is where ACF messages are defined to live. That
+ * loses the timestamp but allows RTPS to share a frame with other ACF traffic.
+ *
+ * Per-stream parameters --- destination MAC, VLAN ID, PCP, transmission
+ * interval, maximum frame size --- are not configured here. They are read from
+ * the @c ieee802-dot1q-cnc-config YANG datastore held by uniconf, which the CNC
+ * populates in response to the CUC's Talker/Listener requests (subclause 7.3.3
+ * of [DDS-TSN]). This descriptor only says *where* to find that datastore and
+ * *which* streams belong to this participant.
+ *
+ * @ingroup TRANSPORT_MODULE
+ */
+struct TSNTransportDescriptor : public PortBasedTransportDescriptor
+{
+    /**
+     * Upper bound on the RTPS message that fits one VLAN-tagged Ethernet frame.
+     *
+     * The exact figure depends on the subtype's header size and is computed per
+     * stream from the interface MTU; this is only the cap applied to the
+     * descriptor. A 24-octet stream header leaves about 1480 octets.
+     */
+    static constexpr uint32_t tsn_max_message_size = 1492;
+
+    /**
+     * Default AVTP subtype: Experimental Format Stream, per IEEE 1722-2016.
+     *
+     * A stream subtype is used rather than a control format because its header
+     * carries @c avtp_timestamp and @c stream_data_length, neither of which
+     * NTSCF has. IEEE 1722 registers no subtype for RTPS, so the Experimental
+     * Format is the honest choice; set @ref avtp_subtype to the Vendor Specific
+     * Format (0x6F) or to NTSCF (0x82) if your deployment needs one of those.
+     */
+    static constexpr uint8_t tsn_default_subtype = 0x7F;
+
+    //! ACF message type used when @ref avtp_subtype is a control format.
+    static constexpr uint8_t tsn_default_acf_message_type = 0x78; // ACF_USER0
+
+    //! Constructor
+    FASTDDS_EXPORTED_API TSNTransportDescriptor();
+
+    //! Copy constructor
+    FASTDDS_EXPORTED_API TSNTransportDescriptor(
+            const TSNTransportDescriptor& t) = default;
+
+    //! Copy assignment
+    FASTDDS_EXPORTED_API TSNTransportDescriptor& operator =(
+            const TSNTransportDescriptor& t) = default;
+
+    //! Destructor
+    virtual FASTDDS_EXPORTED_API ~TSNTransportDescriptor() = default;
+
+    FASTDDS_EXPORTED_API TransportInterface* create_transport() const override;
+
+    //! Comparison operator
+    FASTDDS_EXPORTED_API bool operator ==(
+            const TSNTransportDescriptor& t) const;
+
+    uint32_t min_send_buffer_size() const override
+    {
+        return maxMessageSize;
+    }
+
+    /**
+     * Network interface the AVTP sockets are bound to, e.g. "eth0".
+     *
+     * Required. When a stream found in the CNC configuration names a different
+     * interface, that stream is ignored by this transport instance.
+     */
+    std::string interface_name;
+
+    /**
+     * Path of the uniconf database holding the @c ieee802-dot1q-cnc-config data.
+     *
+     * When empty, the transport assumes uniconf has already been initialised by
+     * the application (i.e. @c ydbi_access_init() has been called) and simply
+     * uses the process-wide handle. Set it only when the transport should open
+     * the database itself.
+     */
+    std::string uniconf_db_name;
+
+    /**
+     * Identifier of the CUC whose Talker/Listener entries describe this node,
+     * matching the @c cuc-id key of the CNC configuration. The CNC uses the
+     * bridge name here.
+     */
+    std::string cuc_id = "br01";
+
+    /**
+     * Instance index of the CNC configuration domain, i.e. the low byte of the
+     * @c domain-id ("domain00" is 0).
+     */
+    uint8_t cnc_instance_index = 0;
+
+    /**
+     * Default multicast MAC address used by the SPDP built-in endpoints.
+     *
+     * Subclause A.6.1.4.1 of [DDS-TSN] gives this as "01:00:5E::EF:FF:00:01",
+     * which is not a well-formed MAC address. It is read here as the IPv4
+     * multicast MAC that maps the UDP/IP PSM default address 239.255.0.1
+     * (0xEF 0xFF 0x00 0x01) following RFC 1112, which yields 01:00:5e:7f:00:01.
+     * Override it if you interoperate with an implementation that reads the
+     * specification differently.
+     */
+    std::string default_multicast_mac = "01:00:5e:7f:00:01";
+
+    /**
+     * VLAN ID used for traffic that has no CNC-provisioned stream, i.e.
+     * discovery traffic. 0 means "no VLAN tag known"; frames are still sent
+     * VLAN-tagged so that the PCP survives, as required to reach a traffic
+     * class in the bridge.
+     */
+    uint16_t default_vlan_id = 0;
+
+    /**
+     * Priority Code Point used for traffic that has no CNC-provisioned stream.
+     * Discovery is not time-critical (subclause 8.2.2.1 of [DDS-TSN]), so this
+     * defaults to best effort.
+     */
+    uint8_t default_pcp = 0;
+
+    /**
+     * Socket priority applied with SO_PRIORITY. This is what a Linux qdisc such
+     * as @c mqprio or @c taprio matches on; it is not necessarily the PCP.
+     */
+    uint8_t socket_priority = 0;
+
+    /**
+     * When true, block until the CNC has marked this node's streams as accepted
+     * before opening any output channel, for at most
+     * @ref cnc_wait_timeout_ms milliseconds.
+     */
+    bool wait_for_cnc = true;
+
+    //! How long to wait for the CNC to accept the configured streams, in milliseconds.
+    uint32_t cnc_wait_timeout_ms = 10000;
+
+    /**
+     * When true, do not send anything on a stream the CNC has not accepted.
+     * When false, unaccepted streams fall back to the default VLAN/PCP so that
+     * traffic still flows, un-scheduled.
+     */
+    bool require_accepted_streams = false;
+
+    /**
+     * When true, use the gPTP-disciplined clock for AVTP timestamps; when
+     * false, use the monotonic system clock. Set it to false on nodes with no
+     * gptp2d running.
+     */
+    bool use_gptp = true;
+
+    /**
+     * Shared memory segment published by gptp2d. Empty selects the library
+     * default, which is what gptp2d creates unless configured otherwise.
+     */
+    std::string gptp_shmem_name;
+
+    //! AVTP header version, 0 or 1.
+    uint8_t avtp_header_version = 0;
+
+    //! IEEE 1722 subtype used to carry RTPS messages.
+    uint8_t avtp_subtype = tsn_default_subtype;
+
+    //! ACF message type used to carry RTPS messages inside the NTSCF PDU.
+    uint8_t acf_message_type = tsn_default_acf_message_type;
+
+    /**
+     * Receive timeout of the listener sockets in milliseconds. The reception
+     * threads use it to check for shutdown, so it bounds how long closing an
+     * input channel takes.
+     */
+    uint32_t reception_timeout_ms = 100;
+};
+
+} // namespace rtps
+} // namespace fastdds
+} // namespace eprosima
+
+#endif // FASTDDS_RTPS_TRANSPORT__TSNTRANSPORTDESCRIPTOR_HPP

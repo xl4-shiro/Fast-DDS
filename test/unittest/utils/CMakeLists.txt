@@ -55,6 +55,23 @@ set(LOCATORTESTS_SOURCE
     ${PROJECT_SOURCE_DIR}/src/cpp/utils/md5.cpp
     ${PROJECT_SOURCE_DIR}/src/cpp/utils/SystemInfo.cpp)
 
+set(ETHERNETLOCATORTESTS_SOURCE
+    EthernetLocatorTests.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/fastdds/core/Time_t.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/common/LocatorWithMask.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/common/Time_t.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/network/utils/netmask_filter.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/network/utils/network.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/transport/network/NetmaskFilterKind.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/transport/network/NetworkInterface.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/rtps/transport/network/NetworkInterfaceWithFilter.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/EthernetLocator.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/Host.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/IPFinder.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/IPLocator.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/md5.cpp
+    ${PROJECT_SOURCE_DIR}/src/cpp/utils/SystemInfo.cpp)
+
 set(FIXEDSIZEQUEUETESTS_SOURCE
     FixedSizeQueueTests.cpp)
 
@@ -147,6 +164,25 @@ if(EPROSIMA_TEST_DNS_NOT_SET_UP)
 endif()
 gtest_discover_tests(LocatorTests TEST_FILTER ${IGNORE_COMMAND})
 unset(IGNORE_COMMAND)
+
+add_executable(EthernetLocatorTests ${ETHERNETLOCATORTESTS_SOURCE})
+target_compile_definitions(EthernetLocatorTests PRIVATE
+    BOOST_ASIO_STANDALONE
+    ASIO_STANDALONE
+    $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+    $<$<BOOL:${INTERNAL_DEBUG}>:__INTERNALDEBUG> # Internal debug activated.
+    )
+target_include_directories(EthernetLocatorTests PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_BINARY_DIR}/include ${Asio_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/src/cpp)
+target_link_libraries(EthernetLocatorTests
+    fastcdr
+    fastdds::log
+    GTest::gtest
+    $<$<BOOL:${QNX}>:socket>
+    ${MOCKS}
+    )
+gtest_discover_tests(EthernetLocatorTests)
 
 add_executable(FixedSizeQueueTests ${FIXEDSIZEQUEUETESTS_SOURCE})
 target_include_directories(FixedSizeQueueTests PRIVATE

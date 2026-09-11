@@ -187,6 +187,16 @@ if (APPLE)
     )
 endif()
 
+if(TSN_TRANSPORT)
+    target_link_libraries(${PROJECT_NAME}
+        PRIVATE
+        PkgConfig::XL4AVTP
+        PkgConfig::XL4UNICONF
+        ${XL4ACF_EXTRA_LIBRARIES}
+        )
+    target_include_directories(${PROJECT_NAME} PRIVATE ${XL4ACF_INCLUDE_DIR})
+endif()
+
 if(MSVC OR MSVC_IDE)
     # On installed binaries use manifest to specify dependencies
     if(INSTALLER_PLATFORM AND OPENSSL_FOUND)

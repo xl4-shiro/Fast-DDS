@@ -30,3 +30,7 @@ add_subdirectory(cpp/xtypes)
 if (SECURITY)
     add_subdirectory(cpp/security)
 endif()
+
+if (TSN_TRANSPORT)
+    add_subdirectory(cpp/tsn)
+endif()
