@@ -26,6 +26,8 @@
 #include <vector>
 
 #include <fastdds/rtps/transport/TransportInterface.hpp>
+
+#include <rtps/transport/MulticastTransportInterface.hpp>
 #include <fastdds/rtps/transport/TSNTransportDescriptor.hpp>
 #include <fastdds/utils/EthernetLocator.hpp>
 
@@ -50,7 +52,9 @@ namespace rtps {
  *
  * @ingroup TRANSPORT_MODULE
  */
-class TSNTransport : public TransportInterface
+class TSNTransport
+    : public TransportInterface
+    , public MulticastTransportInterface
 {
 public:
 
@@ -121,6 +125,23 @@ public:
 
     void AddDefaultOutputLocator(
             LocatorList& defaultList) override;
+
+    /**
+     * Multicast locators for user traffic.
+     *
+     * Implementing MulticastTransportInterface is what lets Fast DDS fill in the
+     * logical port of an endpoint's multicast locator: NetworkFactory reaches
+     * these through a dynamic_cast, and without it a locator supplied by the
+     * application keeps whatever port it was built with, which for a CNC-derived
+     * one is none.
+     */
+    bool getDefaultMulticastLocators(
+            LocatorList& locators,
+            uint32_t multicast_port) const override;
+
+    bool fillMulticastLocator(
+            Locator& locator,
+            uint32_t well_known_port) const override;
 
     bool getDefaultMetatrafficMulticastLocators(
             LocatorList& locators,

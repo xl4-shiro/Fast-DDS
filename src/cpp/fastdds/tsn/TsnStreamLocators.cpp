@@ -40,19 +40,19 @@ static bool to_binding(
         uint16_t logical_port,
         TsnStreamBinding& out)
 {
-    if (!stream.has_data_frame_specification)
-    {
-        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Stream '" << stream.station_name
-                                                       << "' has no data-frame-specification; the CNC has not "
-                                                       << "assigned it a destination MAC address yet");
-        return false;
-    }
-
+    out.has_destination = stream.has_data_frame_specification;
+    out.interface_name = stream.interface_name;
     out.topic_name = stream.station_name;
     out.stream_id = rtps::tsn::stream_id_to_string(stream.stream_id);
     out.accepted = stream.accepted;
     out.max_frame_size = stream.max_frame_size;
     out.max_frames_per_interval = stream.max_frames_per_interval;
+    if (!stream.has_data_frame_specification)
+    {
+        // Describable but not usable: the caller decides whether that matters.
+        return true;
+    }
+
     out.locator = EthernetLocator::create_locator(stream.destination_mac, stream.vlan_id,
                     stream.pcp, logical_port);
 
@@ -75,13 +75,6 @@ static std::vector<TsnStreamBinding> collect(
     const std::vector<TsnStream> streams = talker ? config->talkers() : config->listeners();
     for (const TsnStream& stream : streams)
     {
-        if (stream.station_name.empty())
-        {
-            // Nothing to bind a topic to. The CUC has not named this
-            // end-station interface.
-            continue;
-        }
-
         TsnStreamBinding binding;
         if (to_binding(stream, logical_port, binding))
         {
@@ -129,7 +122,14 @@ bool TsnStreamLocators::find_stream_for_topic(
         return false;
     }
 
-    return to_binding(stream, logical_port, out);
+    if (!to_binding(stream, logical_port, out) || !out.has_destination)
+    {
+        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Stream '" << stream.station_name
+                                                       << "' has no data-frame-specification; the CNC has not "
+                                                       << "assigned it a destination MAC address yet");
+        return false;
+    }
+    return true;
 }
 
 } // namespace tsn

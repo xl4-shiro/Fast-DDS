@@ -145,14 +145,21 @@ public:
     bool refresh();
 
     /**
-     * Block until every stream found for this node is accepted by the CNC.
+     * Block until every stream configured for this node is accepted by the CNC.
      *
-     * @param timeout_ms  Give up after this long.
-     * @return true when all streams are accepted, false on timeout or when no
-     * stream was found at all.
+     * @param timeout_ms  Give up after this long. 0 waits indefinitely.
+     * @param require_streams  When true, keep waiting even if the datastore
+     *                         holds no entry for this node yet --- the CUC may
+     *                         not have written it. When false, return as soon as
+     *                         it is clear there is nothing to wait for, so an
+     *                         unconfigured node does not stall startup.
+     * @return true when all streams are accepted, false on timeout or when
+     * there is nothing to wait for. The caller decides what a false means:
+     * fall back to the defaults, or refuse to start.
      */
     bool wait_for_accepted_streams(
-            uint32_t timeout_ms);
+            uint32_t timeout_ms,
+            bool require_streams = false);
 
     //! Snapshot of the talker streams belonging to this node.
     std::vector<TsnStream> talkers() const;
@@ -161,16 +168,22 @@ public:
     std::vector<TsnStream> listeners() const;
 
     /**
-     * Find the talker stream whose destination MAC and VLAN ID match a locator.
+     * Find the stream whose destination MAC and VLAN ID match a locator.
      *
-     * This is how an outgoing RTPS message gets its stream ID and its shaping:
-     * the destination locator is what the transport has, and the CNC keyed the
-     * stream on the same MAC and VLAN.
+     * This is how traffic gets its stream ID, framing and shaping: the locator
+     * is what the transport has, and the CNC keyed the stream on the same MAC
+     * and VLAN.
+     *
+     * Both lists are searched. A node that only listens to a stream has no
+     * talker entry for it --- the talker entry names another node's interface
+     * and is filtered out when reading --- but its listener entry carries the
+     * same data-frame-specification, read from the talker under the same
+     * stream id.
      *
      * @param vlan_id  VLAN ID to match, or 0 to match on MAC address alone.
-     * @return nullptr when no stream matches.
+     * @return false when no stream matches.
      */
-    bool find_talker_for_destination(
+    bool find_stream_for_destination(
             const MacAddress& destination_mac,
             uint16_t vlan_id,
             TsnStream& out) const;

@@ -347,10 +347,15 @@ bool TsnCncConfig::refresh()
     return true;
 }
 
+#define WAIT_STREAMS_LOOP_SLEEPMS 100 // 100 msec to sleep in one loop
 bool TsnCncConfig::wait_for_accepted_streams(
-        uint32_t timeout_ms)
+        uint32_t timeout_ms,
+        bool require_streams)
 {
+    const bool wait_forever = (0 == timeout_ms);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    bool reported_waiting = false;
+    auto last_report = std::chrono::steady_clock::now();
 
     while (true)
     {
@@ -373,7 +378,7 @@ bool TsnCncConfig::wait_for_accepted_streams(
             return true;
         }
 
-        if (!any)
+        if (!any && !require_streams)
         {
             // Nothing to wait for. The timeout covers the CNC accepting streams
             // the CUC has already requested; when the datastore holds no entry
@@ -387,14 +392,27 @@ bool TsnCncConfig::wait_for_accepted_streams(
             return false;
         }
 
-        if (std::chrono::steady_clock::now() >= deadline)
+        if (!wait_forever && std::chrono::steady_clock::now() >= deadline)
         {
             EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
                     "Timed out waiting for the CNC to accept every configured stream");
             return false;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto now = std::chrono::steady_clock::now();
+        if (!reported_waiting || now - last_report >= std::chrono::seconds(5))
+        {
+            reported_waiting = true;
+            last_report = now;
+            // Say so once: with no timeout this never returns on its own, and a
+            // silent block during participant creation looks like a hang.
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "Waiting for the CNC to provision and accept streams for cuc-id '"
+                    << cuc_id_ << "' on " << interface_name_
+                    << (wait_forever ? "; no timeout is set, so this waits indefinitely" : ""));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_STREAMS_LOOP_SLEEPMS));
         refresh();
     }
 }
@@ -411,29 +429,32 @@ std::vector<TsnStream> TsnCncConfig::listeners() const
     return listeners_;
 }
 
-bool TsnCncConfig::find_talker_for_destination(
+bool TsnCncConfig::find_stream_for_destination(
         const MacAddress& destination_mac,
         uint16_t vlan_id,
         TsnStream& out) const
 {
     std::lock_guard<std::mutex> guard(mutex_);
-    for (const TsnStream& stream : talkers_)
+    for (const auto* list : {&talkers_, &listeners_})
     {
-        if (!stream.has_data_frame_specification)
+        for (const TsnStream& stream : *list)
         {
-            continue;
+            if (!stream.has_data_frame_specification)
+            {
+                continue;
+            }
+            if (stream.destination_mac != destination_mac)
+            {
+                continue;
+            }
+            // A locator with no VLAN ID matches whatever VLAN the CNC assigned.
+            if (0 != vlan_id && stream.vlan_id != vlan_id)
+            {
+                continue;
+            }
+            out = stream;
+            return true;
         }
-        if (stream.destination_mac != destination_mac)
-        {
-            continue;
-        }
-        // A locator with no VLAN ID matches whatever VLAN the CNC assigned.
-        if (0 != vlan_id && stream.vlan_id != vlan_id)
-        {
-            continue;
-        }
-        out = stream;
-        return true;
     }
     return false;
 }

@@ -17,19 +17,19 @@ DataWriter::write()
   TSNTransport::send()  -- picks the stream for the destination locator
   |
   AvtpStream::send()    -- wraps it and hands it to a raw AF_PACKET socket
-  v
-+-------------------------------------------------------------+
-| Ethernet: dst MAC | src MAC | 802.1Q tag (VID, PCP) | 0x22F0 |
-+-------------------------------------------------------------+
-| AVTP stream header, 24 octets:                               |
-|   subtype 0x7F (EF_STREAM) | sv | tv | sequence_num          |
-|   stream_id (8) | avtp_timestamp (4)                         |
-|   stream_data_length (2)                                     |
-+-------------------------------------------------------------+
-| dst logical port (2) | src logical port (2) | rtps_length(2) |
-+-------------------------------------------------------------+
-| RTPS message                                                 |
-+-------------------------------------------------------------+
+
+|--------------------------------+----------------------+-----------------------+--------------|
+| Ethernet: dst MAC              | src MAC              | 802.1Q tag (VID, PCP) |       0x22F0 |
+|--------------------------------+----------------------+-----------------------+--------------|
+| AVTP stream header, 24 octets: |                      |                       |              |
+| subtype 0x7F (EF_STREAM)       | sv                   | tv                    | sequence_num |
+| stream_id (8)                  | avtp_timestamp (4)   |                       |              |
+| stream_data_length (2)         |                      |                       |              |
+|--------------------------------+----------------------+-----------------------+--------------|
+| dst logical port (2)           | src logical port (2) | rtps_length(2)        |              |
+|--------------------------------+----------------------+-----------------------+--------------|
+| RTPS message                   |                      |                       |              |
+|--------------------------------+----------------------+-----------------------+--------------|
 ```
 
 IEEE 1722 registers no subtype for RTPS, so the Experimental Format Stream
@@ -209,8 +209,52 @@ specification, plus an `accept` flag. This example reads that back:
   set to `CONNECTED` when the participant starts and `DISCONNECTED` when it
   stops, so the CUC can see which endpoints are live.
 
-Set `require_accepted_streams` (`--require-streams`) to refuse sending on a
-stream the CNC has not accepted, rather than falling back.
+### Strict mode
+
+By default a destination the CNC knows nothing about is still reached, over the
+descriptor's `default_vlan_id` and `default_pcp` with a locally derived stream
+ID. Traffic flows, but unscheduled. Discovery depends on this, since the CUC has
+no reason to provision a stream for SPDP.
+
+Set `allow_fallback` to false (`--no-fallback`) where sending off-schedule is
+worse than not sending. Two things then change:
+
+- The transport waits during initialisation for the CNC to provision *and*
+  accept every stream for this node, for at most `cnc_wait_timeout_ms`
+  (`--cnc-timeout`, default 10000). If that expires it logs an error and refuses
+  to start, which makes `create_participant()` fail and return `nullptr`.
+- An endpoint whose topic has no provisioned stream is refused at creation,
+  rather than quietly sending on the participant's own locators.
+
+Discovery is deliberately *not* blocked. It is framed as a control format, not a
+stream, so there is nothing to schedule and nothing to refuse --- which is what
+subclause 8.2.2.1 intends when it puts discovery on non-critical channels. The
+transport keeps a refusal for stream traffic with no schedule behind it, but
+that is a safety net; the enforcement that matters is at the two points above.
+
+The endpoint check lives in the example rather than the transport on purpose: a
+transport sees only locators, so it cannot tell user data bound for no stream
+from discovery reaching an unknown peer. The DDS layer knows which topic an
+endpoint serves, and is the only layer that can.
+
+```bash
+./tsn publisher -i eth0 -t ControlCommand --uniconf-db /var/lib/uniconf.db \
+      --no-fallback --cnc-timeout 30000
+```
+
+`cnc_wait_timeout_ms` governs both modes; only the consequence of expiry
+differs:
+
+|                                   | timeout expires                              |
+|-----------------------------------+----------------------------------------------|
+| `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP |
+| `allow_fallback = false`          | error, transport does not start,             |
+|                                   | participant creation fails                   |
+
+A timeout of **0 waits indefinitely**. In strict mode that means participant
+creation does not return until the CNC responds, and the process can only be
+stopped by a signal --- the example exits immediately on SIGINT/SIGTERM while
+still starting up, rather than appearing to hang.
 
 ## QoS
 
@@ -259,6 +303,103 @@ non-default segment.
 Without a CNC, leave `--uniconf-db` unset. The transport logs that uniconf is
 unavailable and sends everything on the default VLAN and PCP, unscheduled, which
 is enough to see samples flow.
+
+## Reading the traffic in Wireshark
+
+Wireshark decodes the IEEE 1722 framing on its own, but stops at the ACF payload
+because ACF_USER0 is, by definition, whatever the application puts there. The
+Lua dissector in `rtps_over_1722.lua` picks up from that point: it adds the
+six-octet TSN-RTPS header and hands the message to Wireshark's own `rtps`
+dissector, so submessages, GUIDs and QoS decode as usual.
+
+```bash
+tshark -X lua_script:rtps_over_1722.lua -r capture.pcap
+wireshark -X lua_script:rtps_over_1722.lua capture.pcap
+```
+
+Copy it to `~/.local/lib/wireshark/plugins/` to load it for every capture.
+
+It registers on the subdissector tables the built-in `ieee1722` dissector
+already offers --- `ieee1722.subtype` for both subtypes, and `acf.msg_type` for
+ACF_USER0 --- rather than claiming EtherType `0x22F0`. On the control subtype it
+chains straight into Wireshark's own NTSCF dissector, so `ieee1722.*`, `ntscf.*`
+and `acf.*` stay populated and other AVB traffic in the same capture is
+unaffected:
+
+```
+eth:ethertype:vlan:ethertype:ieee1722:tsnrtps_ctrl:ntscf:acf:tsnrtps_acf:rtps
+eth:ethertype:vlan:ethertype:ieee1722:tsnrtps_stream:rtps
+```
+
+A capture made against a talker with the pre-2026 `avtpcon` NTSCF bug decodes
+too. That bug wrote `ntscf_data_length` into the wrong bit field, and Wireshark
+--- correctly --- will not walk into a payload the header says is two octets
+long, so the ACF message is never reached and the frame shows no RTPS at all.
+When the declared length disagrees with the frame, this dissector decodes the
+control header itself rather than chaining, and marks the frame:
+
+```
+ntscf_data_length 2, frame carries 544
+NTSCF length is wrong; RTPS recovered from the fixed header offsets
+```
+
+Such frames appear as `ieee1722:tsnrtps_ctrl:rtps`, without the `ntscf` and
+`acf` layers. If you see that on live traffic, the talker is running an
+`avtpcon` that predates the fix.
+
+The Info column names the builtin endpoint each message belongs to, so discovery
+traffic can be read at a glance:
+
+```
+INFO_TS, DATA(p), Unknown[80]                   [SPDP, control port 7400]
+INFO_TS, DATA(p), Unknown[80]                   [SPDP, control port 7410]
+INFO_DST, INFO_TS, DATA(w) -> ControlCommand    [SEDP-pub, control port 7410]
+INFO_DST, ACKNACK, Unknown[80]                  [SEDP-sub, control port 7410]
+INFO_DST, INFO_TS, DATA -> ControlCommand       [stream port 7401]
+```
+
+The label comes from the RTPS writer entity ID, not the logical port, because
+the port cannot tell SPDP from SEDP on its own --- both lines above say `SPDP`,
+one on 7400 and one on 7410.
+
+That is not a stray reply. Once a participant has been discovered, Fast DDS adds
+its metatraffic unicast locator to the SPDP writer's destination list, so every
+periodic announcement afterwards goes to the multicast address *and* separately
+to each known peer, landing on the same port that carries SEDP. The two copies
+are the same sample: same writer, same sequence number, sent within a
+millisecond of each other.
+
+```
+ 7  2.9760  -> 01:00:5e:7f:00:01 :7400  seq=1   first announcement, multicast only
+14  2.9961  -> 82:a5:0d:66:eb:6f :7410  seq=1   peer now known
+30  3.0761  -> 82:a5:0d:66:eb:6f :7410  seq=1   from here on, every tick is sent twice
+31  3.0762  -> 01:00:5e:7f:00:01 :7400  seq=1
+```
+
+So discovery costs one frame per announcement plus one more per known
+participant, which is worth remembering when sizing a control stream: with the
+default 100 ms announcement period and N peers, that is 10*(N+1) frames per
+second per participant.
+
+`SEDP-topic`, `WLP` and `TypeLookup-req`/`-rep` are labelled too; user-defined
+writers are left unlabelled so the column stays quiet for ordinary data.
+
+Useful filters:
+
+| Filter                             | Selects                                              |
+|------------------------------------+------------------------------------------------------|
+| `tsnrtps`                          | every RTPS-carrying 1722 frame                       |
+| `rtps.sm.wrEntityId == 0x000100c2` | SPDP, on either port                                 |
+| `rtps.sm.wrEntityId in             | SEDP, publications and subscriptions                 |
+| {0x000003c2, 0x000004c2}`          |                                                      |
+| `tsnrtps.dst_port == 7400`         | the metatraffic multicast channel                    |
+| `tsnrtps.stream_uid == 1`          | frames carrying a given stream ID, stream or control |
+| `ieee1722.subtype == 0x7f`         | stream framing, i.e. CNC-provisioned traffic         |
+| `ieee1722.subtype == 0x82`         | control framing, i.e. discovery and fallback         |
+
+If the transport is configured for a different subtype or ACF message type,
+change the matching preference under *Protocols > TSNRTPS*; the dissector
+re-registers itself when the preference changes.
 
 ## Known deviations from the specification
 

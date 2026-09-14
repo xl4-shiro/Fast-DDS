@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
 #include <iostream>
@@ -50,10 +51,19 @@ using eprosima::fastdds::rtps::TSNTransportDescriptor;
 namespace {
 
 std::atomic<bool> g_running{true};
+std::atomic<bool> g_started{false};
 
 void signal_handler(
-        int)
+        int signal_number)
 {
+    // Until the participant exists we may be inside create_participant(), which
+    // with --no-fallback waits for the CNC and never looks at g_running. Asking
+    // it to stop politely would be ignored, so exit outright: a startup that
+    // cannot be interrupted is worse than an abrupt one.
+    if (!g_started.load())
+    {
+        std::_Exit(128 + signal_number);
+    }
     g_running.store(false);
 }
 
@@ -71,7 +81,8 @@ struct Options
     uint32_t samples = 0;
     uint32_t period_ms = 100;
     uint32_t payload_size = 0;
-    bool require_streams = false;
+    uint32_t cnc_timeout_ms = 10000;
+    bool allow_fallback = true;
     bool no_gptp = false;
 };
 
@@ -95,7 +106,10 @@ void print_usage(
         "  -p, --period <ms>       Publication period in milliseconds (default 100)\n"
         "      --payload <bytes>   Pad each sample to this size. Above about 1400 octets RTPS\n"
         "                          splits the sample across several frames as DataFrag\n"
-        "      --require-streams   Refuse to send on a stream the CNC has not accepted\n"
+        "      --no-fallback       Never send unscheduled. Waits for the CNC to provision and\n"
+        "                          accept this node's streams, then refuses any destination it\n"
+        "                          has no stream for. Fails to start if the wait times out\n"
+        "      --cnc-timeout <ms>  How long to wait for the CNC (default 10000, 0 = forever)\n"
         "      --no-gptp           Timestamp with the monotonic clock instead of gPTP\n"
         << std::endl;
 }
@@ -169,9 +183,13 @@ bool parse_options(
         {
             options.payload_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         }
-        else if ("--require-streams" == arg)
+        else if ("--cnc-timeout" == arg && has_value)
         {
-            options.require_streams = true;
+            options.cnc_timeout_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
+        }
+        else if ("--no-fallback" == arg)
+        {
+            options.allow_fallback = false;
         }
         else if ("--no-gptp" == arg)
         {
@@ -187,6 +205,10 @@ bool parse_options(
     return true;
 }
 
+void list_streams(
+        const Options& options,
+        const TSNTransportDescriptor& descriptor);
+
 TSNTransportDescriptor make_descriptor(
         const Options& options)
 {
@@ -198,7 +220,8 @@ TSNTransportDescriptor make_descriptor(
     descriptor.default_vlan_id = options.vlan_id;
     descriptor.default_pcp = options.pcp;
     descriptor.socket_priority = options.pcp;
-    descriptor.require_accepted_streams = options.require_streams;
+    descriptor.allow_fallback = options.allow_fallback;
+    descriptor.cnc_wait_timeout_ms = options.cnc_timeout_ms;
     descriptor.use_gptp = !options.no_gptp;
     return descriptor;
 }
@@ -213,6 +236,28 @@ DomainParticipant* create_participant(
         const Options& options,
         const TSNTransportDescriptor& descriptor)
 {
+    if (!options.uniconf_db.empty())
+    {
+        list_streams(options, descriptor);
+    }
+
+    if (!options.allow_fallback)
+    {
+        // Fast DDS logs at Error by default, so the transport's "waiting for the
+        // CNC" warning would not show and this would look like a hang.
+        std::cout << "Strict mode: waiting for the CNC to provision and accept streams for cuc-id '"
+                  << options.cuc_id << "' on " << options.interface_name << " (";
+        if (0 == options.cnc_timeout_ms)
+        {
+            std::cout << "no timeout; interrupt to give up";
+        }
+        else
+        {
+            std::cout << "up to " << options.cnc_timeout_ms << " ms, then giving up";
+        }
+        std::cout << ")." << std::endl;
+    }
+
     DomainParticipantQos qos = PARTICIPANT_QOS_DEFAULT;
     qos.name(options.publisher ? "tsn_publisher" : "tsn_subscriber");
     qos.transport().use_builtin_transports = false;
@@ -223,41 +268,135 @@ DomainParticipant* create_participant(
 }
 
 /**
- * Point an endpoint at the TSN Stream the CNC provisioned for its topic.
+ * Look up the TSN Stream the CNC provisioned for a topic.
  *
- * Without this the endpoint would use the participant's own locators and its
- * frames would be indistinguishable, at the network, from every other topic's,
- * so the CNC could not schedule them as a stream of their own.
+ * @return false when the CUC has not named a stream for it.
  */
-template<typename EndpointQos>
-void bind_to_stream(
-        EndpointQos& qos,
+/**
+ * Print every stream the CNC has provisioned for this node.
+ *
+ * Without this, a node that stalls waiting for the CNC, or that reports no
+ * stream for its topic, gives no clue which of the two it is: an entry missing
+ * altogether, one on another interface, one not yet accepted, or one whose
+ * station-name does not match the topic.
+ */
+void list_streams(
+        const Options& options,
+        const TSNTransportDescriptor& descriptor)
+{
+    const auto talkers = tsn::TsnStreamLocators::talker_streams(descriptor, 0);
+    const auto listeners = tsn::TsnStreamLocators::listener_streams(descriptor, 0);
+
+    std::cout << "CNC streams for cuc-id '" << options.cuc_id << "' on " << options.interface_name
+              << ": " << talkers.size() << " talker, " << listeners.size() << " listener" << std::endl;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (const auto& b : (0 == pass ? talkers : listeners))
+        {
+            std::cout << "  " << (0 == pass ? "talker  " : "listener")
+                      << " station-name='" << b.topic_name << "'"
+                      << " if=" << b.interface_name
+                      << " stream=" << b.stream_id
+                      << " accepted=" << (b.accepted ? "yes" : "no");
+            if (b.has_destination)
+            {
+                std::cout << " dest=" << EthernetLocator::mac_to_string(b.locator)
+                          << " vlan=" << EthernetLocator::vid(b.locator)
+                          << " pcp=" << static_cast<int>(EthernetLocator::pcp(b.locator));
+            }
+            else
+            {
+                std::cout << " dest=<none: no data-frame-specification>";
+            }
+            std::cout << std::endl;
+        }
+    }
+}
+
+bool find_stream(
+        const Options& options,
+        const TSNTransportDescriptor& descriptor,
+        bool talker,
+        tsn::TsnStreamBinding& binding)
+{
+    if (!tsn::TsnStreamLocators::find_stream_for_topic(descriptor, options.topic_name,
+            talker, 0, binding))
+    {
+        std::cout << "No CNC " << (talker ? "talker" : "listener") << " stream is named '"
+                  << options.topic_name << "'"
+                  << (options.allow_fallback ? "; using the participant's default locators." : ".")
+                  << std::endl;
+        return false;
+    }
+
+    // Only the reader ends up carrying a locator, so only the reader should be
+    // described as bound to one. On the writer the locator here is a bare
+    // destination with no RTPS logical port --- nothing fills that in, because
+    // the writer sends to whatever its matched readers announce.
+    std::cout << "Topic '" << binding.topic_name << "' "
+              << (talker ? "will be sent on" : "is bound to")
+              << " stream " << binding.stream_id
+              << " (VLAN " << EthernetLocator::vid(binding.locator)
+              << ", PCP " << static_cast<int>(EthernetLocator::pcp(binding.locator))
+              << ", dest " << EthernetLocator::mac_to_string(binding.locator)
+              << ", accepted by the CNC: " << (binding.accepted ? "yes" : "no") << ")"
+              << std::endl;
+    return true;
+}
+
+/**
+ * Point a DataReader at the stream provisioned for its topic.
+ *
+ * Only the reader needs this. An endpoint's locator lists say where that
+ * endpoint can be reached, and a writer sends to the locators its matched
+ * readers announced --- so putting the stream's group address on the reader is
+ * what actually moves the data onto the stream.
+ */
+bool bind_reader_to_stream(
+        DataReaderQos& qos,
         const Options& options,
         const TSNTransportDescriptor& descriptor)
 {
     tsn::TsnStreamBinding binding;
-    if (!tsn::TsnStreamLocators::find_stream_for_topic(descriptor, options.topic_name,
-            options.publisher, 0, binding))
+    if (!find_stream(options, descriptor, false, binding))
     {
-        std::cout << "No CNC stream is named '" << options.topic_name
-                  << "'; using the participant's default locators." << std::endl;
-        return;
+        // In strict mode an unbound endpoint would receive its data on the
+        // participant's own locators, off any schedule. Refuse it here: this is
+        // the only layer that knows which topic an endpoint serves, so it is
+        // the only one that can tell unscheduled user data from discovery.
+        return options.allow_fallback;
     }
 
-    std::cout << "Topic '" << binding.topic_name << "' is bound to stream " << binding.stream_id
-              << " at " << binding.locator
-              << " (VLAN " << EthernetLocator::vid(binding.locator)
-              << ", PCP " << static_cast<int>(EthernetLocator::pcp(binding.locator))
-              << ", accepted by the CNC: " << (binding.accepted ? "yes" : "no") << ")"
-              << std::endl;
-
     qos.endpoint().multicast_locator_list.push_back(binding.locator);
-
-    // Subclause 8.2.2.2 of [DDS-TSN]: matching is by topic, type and QoS, so a
-    // DataWriter that is a Talker could otherwise match a DataReader that is not
-    // a Listener of the stream. Partitioning on the stream name keeps the
-    // endpoints of one stream to themselves.
     qos.properties().properties().emplace_back("dds.tsn.stream_id", binding.stream_id);
+    return true;
+}
+
+/**
+ * Report the talker stream this node will send the topic on.
+ *
+ * The writer needs no locator of its own: when it sends to the group address
+ * the reader announced, TSNTransport matches that destination back to this
+ * stream and applies its ID, PCP and shaper rate. Putting the address on the
+ * writer's own multicast_locator_list would instead advertise where the writer
+ * receives ACKNACKs, which under the BEST_EFFORT QoS above do not exist.
+ *
+ * Looking it up is still worth doing: it checks that the CUC has provisioned
+ * the talker side, which is what the transport will require when sending.
+ */
+bool report_talker_stream(
+        DataWriterQos& qos,
+        const Options& options,
+        const TSNTransportDescriptor& descriptor)
+{
+    tsn::TsnStreamBinding binding;
+    if (!find_stream(options, descriptor, true, binding))
+    {
+        return options.allow_fallback;
+    }
+
+    qos.properties().properties().emplace_back("dds.tsn.stream_id", binding.stream_id);
+    return true;
 }
 
 /**
@@ -349,10 +488,16 @@ int run_publisher(
     DomainParticipant* participant = create_participant(options, descriptor);
     if (nullptr == participant)
     {
-        std::cerr << "Cannot create the participant. Raw sockets need CAP_NET_RAW: try "
-                  << "'sudo setcap cap_net_raw+ep <binary>' or run as root." << std::endl;
+        // Do not guess at the cause: creation fails for several reasons and the
+        // transport has already logged the specific one.
+        std::cerr << "Cannot create the participant; see the errors above. Common causes: "
+                  << "raw sockets need CAP_NET_RAW ('sudo setcap cap_net_raw+ep <binary>' or run "
+                  << "as root), and with --no-fallback the CNC must provision this node's streams "
+                  << "before the timeout." << std::endl;
         return 1;
     }
+
+    g_started.store(true);
 
     TypeSupport type(new HelloWorldPubSubType());
     type.register_type(participant);
@@ -362,7 +507,12 @@ int run_publisher(
 
     DataWriterQos writer_qos = DATAWRITER_QOS_DEFAULT;
     apply_time_critical_qos(writer_qos);
-    bind_to_stream(writer_qos, options, descriptor);
+    if (!report_talker_stream(writer_qos, options, descriptor))
+    {
+        std::cerr << "No CNC talker stream for topic '" << options.topic_name
+                  << "' and --no-fallback is set; refusing to publish unscheduled." << std::endl;
+        return 1;
+    }
 
     WriterListener listener;
     DataWriter* writer = publisher->create_datawriter(topic, writer_qos, &listener);
@@ -400,10 +550,16 @@ int run_subscriber(
     DomainParticipant* participant = create_participant(options, descriptor);
     if (nullptr == participant)
     {
-        std::cerr << "Cannot create the participant. Raw sockets need CAP_NET_RAW: try "
-                  << "'sudo setcap cap_net_raw+ep <binary>' or run as root." << std::endl;
+        // Do not guess at the cause: creation fails for several reasons and the
+        // transport has already logged the specific one.
+        std::cerr << "Cannot create the participant; see the errors above. Common causes: "
+                  << "raw sockets need CAP_NET_RAW ('sudo setcap cap_net_raw+ep <binary>' or run "
+                  << "as root), and with --no-fallback the CNC must provision this node's streams "
+                  << "before the timeout." << std::endl;
         return 1;
     }
+
+    g_started.store(true);
 
     TypeSupport type(new HelloWorldPubSubType());
     type.register_type(participant);
@@ -413,7 +569,12 @@ int run_subscriber(
 
     DataReaderQos reader_qos = DATAREADER_QOS_DEFAULT;
     apply_time_critical_qos(reader_qos);
-    bind_to_stream(reader_qos, options, descriptor);
+    if (!bind_reader_to_stream(reader_qos, options, descriptor))
+    {
+        std::cerr << "No CNC listener stream for topic '" << options.topic_name
+                  << "' and --no-fallback is set; refusing to subscribe unscheduled." << std::endl;
+        return 1;
+    }
 
     ReaderListener listener;
     DataReader* reader = subscriber->create_datareader(topic, reader_qos, &listener);
@@ -421,6 +582,17 @@ int run_subscriber(
     {
         std::cerr << "Cannot create the DataReader" << std::endl;
         return 1;
+    }
+
+    // Read back the locators the reader ended up announcing. The logical port is
+    // assigned during creation, so this is the only point at which it is real.
+    eprosima::fastdds::rtps::LocatorList listening;
+    if (RETCODE_OK == reader->get_listening_locators(listening))
+    {
+        for (const auto& locator : listening)
+        {
+            std::cout << "  listening on " << locator << std::endl;
+        }
     }
 
     while (g_running.load() && (0 == options.samples || listener.received() < options.samples))

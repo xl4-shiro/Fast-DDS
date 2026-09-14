@@ -108,9 +108,12 @@ uint32_t TSNTransport::max_rtps_message_for_interface() const
     constexpr uint32_t acf_header_size = 2u;
     constexpr uint32_t rtps_header_size = 6u; // tsn::TsnRtpsHeader::size
 
-    const bool uses_acf = (0x82 == configuration_.avtp_subtype || 0x06 == configuration_.avtp_subtype);
+    // Take the larger of the two framings: the same participant sends discovery
+    // on the control format and user data on a stream subtype, and one maximum
+    // message size has to fit both.
+    const uint32_t control_overhead = control_header_size + acf_header_size;
     uint32_t overhead = vlan_tag_size + rtps_header_size;
-    overhead += uses_acf ? (control_header_size + acf_header_size) : stream_header_size;
+    overhead += std::max(control_overhead, stream_header_size);
 
     if (interface_mtu_ <= overhead)
     {
@@ -179,16 +182,39 @@ bool TSNTransport::init(
     cnc_config_ = TsnCncConfig::create(configuration_);
     if (cnc_config_)
     {
-        if (configuration_.wait_for_cnc)
+        const bool strict = !configuration_.allow_fallback;
+        if (strict || configuration_.wait_for_cnc)
         {
-            cnc_config_->wait_for_accepted_streams(configuration_.cnc_wait_timeout_ms);
+            // Strict mode keeps waiting even while the datastore is empty: the
+            // CUC may not have written this node's entries yet.
+            const bool ready = cnc_config_->wait_for_accepted_streams(
+                configuration_.cnc_wait_timeout_ms, strict);
+
+            if (!ready && strict)
+            {
+                // Nothing may go out unscheduled, and the CNC has not provided a
+                // schedule, so there is nothing this transport can legitimately
+                // do. Failing here makes participant creation fail, which is the
+                // honest outcome.
+                EPROSIMA_LOG_ERROR(TSN_TRANSPORT,
+                        "Gave up after " << configuration_.cnc_wait_timeout_ms
+                                         << " ms waiting for the CNC to provision and accept streams for cuc-id '"
+                                         << configuration_.cuc_id << "' on " << configuration_.interface_name
+                                         << ". allow_fallback is false, so the transport will not start. "
+                                         << "Raise cnc_wait_timeout_ms, set it to 0 to wait indefinitely, "
+                                         << "or allow the fallback.");
+                return false;
+            }
         }
         cnc_config_->report_status_for_all(tsn::EndStationStatus::connected);
     }
-    else if (configuration_.require_accepted_streams)
+    else if (!configuration_.allow_fallback)
     {
+        // Without a datastore there is nothing to wait for and nothing to fall
+        // back to, so this cannot be satisfied at all.
         EPROSIMA_LOG_ERROR(TSN_TRANSPORT,
-                "require_accepted_streams is set but the CNC configuration is unavailable");
+                "allow_fallback is false but the CNC configuration is unavailable; "
+                "set uniconf_db_name, or initialise uniconf before creating the participant");
         return false;
     }
 
@@ -305,7 +331,10 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
     config.vlan_id = EthernetLocator::vid(locator);
     config.pcp = EthernetLocator::pcp(locator);
     config.socket_priority = configuration_.socket_priority;
-    config.subtype = configuration_.avtp_subtype;
+    // Default to the control format. A provisioned stream switches to the
+    // stream subtype below; everything else --- discovery above all --- stays on
+    // the control format, because several nodes share its destination address.
+    config.subtype = configuration_.control_subtype;
     config.header_version = configuration_.avtp_header_version;
     config.acf_message_type = configuration_.acf_message_type;
     config.use_gptp = configuration_.use_gptp;
@@ -327,14 +356,22 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
     // provisioned one: it has to be unique per stream on this node, which the
     // destination locator alone cannot guarantee.
 
-    if (talker && cnc_config_)
+    // Both directions need this lookup, not just talkers: a listener's input
+    // channel has to use the same subtype, and therefore the same AVTP header
+    // size, as the talker sending to it. The destination MAC of that channel is
+    // the stream's group address, which is exactly what the talker entry is
+    // keyed on.
+    if (cnc_config_)
     {
         TsnStream stream;
-        if (cnc_config_->find_talker_for_destination(config.destination_mac,
+        if (cnc_config_->find_stream_for_destination(config.destination_mac,
                 EthernetLocator::vid(locator), stream))
         {
             config.stream_id = stream.stream_id;
             config.stream_id_from_cnc = true;
+            // One talker, its own destination address: streaming data, as
+            // IEEE 1722 requires of a stream subtype.
+            config.subtype = configuration_.stream_subtype;
             config.vlan_id = stream.vlan_id;
             config.pcp = stream.pcp;
             config.socket_priority = stream.pcp;
@@ -347,10 +384,15 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
                                                             << " on VLAN " << stream.vlan_id
                                                             << " PCP " << static_cast<int>(stream.pcp));
         }
-        else if (configuration_.require_accepted_streams)
+        else if (talker && !configuration_.allow_fallback)
         {
-            EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "No CNC stream for destination "
-                    << EthernetLocator::mac_to_string(locator) << "; the frame will not be sent");
+            // Not fatal: this is how discovery reaches a peer the CNC knows
+            // nothing about. What strict mode guarantees is that the node does
+            // not start until its own streams are accepted, and that endpoints
+            // whose topic has no stream are refused at creation.
+            EPROSIMA_LOG_INFO(TSN_TRANSPORT, "No CNC stream for destination "
+                    << EthernetLocator::mac_to_string(locator)
+                    << "; sending as control format");
         }
     }
 
@@ -404,6 +446,20 @@ AvtpStream* TSNTransport::get_or_open_talker(
     if (it != talkers_.end())
     {
         return it->second.get();
+    }
+
+    if (!config.stream_id_from_cnc && !configuration_.allow_fallback &&
+            config.subtype != configuration_.control_subtype)
+    {
+        // A safety net rather than the main enforcement. Traffic with no CNC
+        // stream is framed as a control format, which is not stream traffic and
+        // must not be blocked --- discovery depends on it, and subclause 8.2.2.1
+        // of [DDS-TSN] puts discovery on non-critical channels by design.
+        // Reaching here would mean something asked for stream framing without a
+        // schedule to go with it.
+        EPROSIMA_LOG_ERROR(TSN_TRANSPORT, "Refusing stream traffic to "
+                << EthernetLocator::mac_to_string(locator) << " with no CNC-provisioned stream");
+        return nullptr;
     }
 
     if (!config.stream_id_from_cnc)
@@ -496,7 +552,9 @@ bool TSNTransport::OpenInputChannel(
         it = input_channels_.emplace(key, std::move(channel)).first;
 
         EPROSIMA_LOG_INFO(TSN_TRANSPORT, "Listening on " << EthernetLocator::mac_to_string(locator)
-                                                         << " VLAN " << key.vlan_id);
+                                                         << " VLAN " << key.vlan_id
+                                                         << ", subtype 0x" << std::hex
+                                                         << static_cast<int>(config.subtype) << std::dec);
     }
 
     if (!it->second->add_receiver(locator, receiver))
@@ -640,6 +698,35 @@ void TSNTransport::AddDefaultOutputLocator(
 {
     defaultList.push_back(EthernetLocator::create_locator(default_multicast_mac_,
             configuration_.default_vlan_id, configuration_.default_pcp, 0));
+}
+
+bool TSNTransport::getDefaultMulticastLocators(
+        LocatorList& locators,
+        uint32_t multicast_port) const
+{
+    locators.push_back(EthernetLocator::create_locator(default_multicast_mac_,
+            configuration_.default_vlan_id, configuration_.default_pcp,
+            static_cast<uint16_t>(multicast_port)));
+    return true;
+}
+
+bool TSNTransport::fillMulticastLocator(
+        Locator& locator,
+        uint32_t well_known_port) const
+{
+    // Not the inherited implementation: it tests locator.port == 0, and an
+    // Ethernet locator packs the VLAN ID and PCP into that same field, so it is
+    // non-zero even when the RTPS logical port is unset. Only the logical port
+    // half may be filled in here.
+    if (0 == EthernetLocator::logical_port(locator))
+    {
+        EthernetLocator::set_logical_port(locator, static_cast<uint16_t>(well_known_port));
+    }
+    if (!IsAddressDefined(locator))
+    {
+        EthernetLocator::set_mac(locator, default_multicast_mac_);
+    }
+    return true;
 }
 
 bool TSNTransport::getDefaultMetatrafficMulticastLocators(

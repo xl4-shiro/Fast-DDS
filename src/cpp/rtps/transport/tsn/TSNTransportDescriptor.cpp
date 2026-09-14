@@ -47,11 +47,12 @@ bool TSNTransportDescriptor::operator ==(
            socket_priority == t.socket_priority &&
            wait_for_cnc == t.wait_for_cnc &&
            cnc_wait_timeout_ms == t.cnc_wait_timeout_ms &&
-           require_accepted_streams == t.require_accepted_streams &&
+           allow_fallback == t.allow_fallback &&
            use_gptp == t.use_gptp &&
            gptp_shmem_name == t.gptp_shmem_name &&
            avtp_header_version == t.avtp_header_version &&
-           avtp_subtype == t.avtp_subtype &&
+           stream_subtype == t.stream_subtype &&
+           control_subtype == t.control_subtype &&
            acf_message_type == t.acf_message_type &&
            reception_timeout_ms == t.reception_timeout_ms &&
            PortBasedTransportDescriptor::operator ==(t);

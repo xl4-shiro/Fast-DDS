@@ -380,7 +380,7 @@ bool AvtpStream::receive(
     const uint8_t* const rtps_message = encapsulated + TsnRtpsHeader::size;
     if (!has_rtps_magic(rtps_message, header.rtps_length))
     {
-        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding ACF message that does not carry an RTPS message");
+        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding a PDU that does not carry an RTPS message");
         return false;
     }
 

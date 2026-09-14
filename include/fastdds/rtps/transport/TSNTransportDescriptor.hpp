@@ -38,7 +38,10 @@ class TransportInterface;
  * The kind of the locators handled by this transport is
  * eprosima::fastdds::rtps::LOCATOR_KIND_ETHERNET.
  *
- * Every RTPS message is the payload of exactly one Ethernet frame:
+ * Every RTPS message is the payload of exactly one Ethernet frame, framed
+ * according to whether the CNC has provisioned a stream for its destination.
+ *
+ * On a provisioned stream, a stream subtype:
  *
  * @code
  * [ Ethernet header | 802.1Q VLAN tag | EtherType 0x22F0 ]
@@ -48,10 +51,23 @@ class TransportInterface;
  * [ RTPS message: Header + Submessages ]
  * @endcode
  *
- * Setting @ref avtp_subtype to a control format (NTSCF 0x82 or TSCF 0x06)
- * instead wraps the same payload in an ACF message of type
- * @ref acf_message_type, which is where ACF messages are defined to live. That
- * loses the timestamp but allows RTPS to share a frame with other ACF traffic.
+ * Otherwise --- discovery, and anything else the CNC does not know about --- a
+ * control format, whose payload is one ACF message:
+ *
+ * @code
+ * [ Ethernet header | 802.1Q VLAN tag | EtherType 0x22F0 ]
+ * [ NTSCF header: subtype=0x82, ntscf_data_length, sequence_num, stream_id ]
+ * [ ACF header: msg_type=ACF_USER0, msg_length ]
+ * [ destination logical port | source logical port | rtps_length ]
+ * [ RTPS message: Header + Submessages ]
+ * @endcode
+ *
+ * The split is not a preference. IEEE 1722 allows only one Talker per
+ * destination address for streaming data, and discovery is many-to-many: every
+ * participant announces to the same group address. Carrying that in a stream
+ * subtype would put several talkers on one destination address. A control
+ * format has no such restriction --- it is how ADP and MAAP already work --- at
+ * the cost of the timestamp, which discovery does not need.
  *
  * Per-stream parameters --- destination MAC, VLAN ID, PCP, transmission
  * interval, maximum frame size --- are not configured here. They are read from
@@ -74,17 +90,30 @@ struct TSNTransportDescriptor : public PortBasedTransportDescriptor
     static constexpr uint32_t tsn_max_message_size = 1492;
 
     /**
-     * Default AVTP subtype: Experimental Format Stream, per IEEE 1722-2016.
+     * Subtype for traffic on a CNC-provisioned stream: Experimental Format
+     * Stream, per IEEE 1722-2016.
      *
-     * A stream subtype is used rather than a control format because its header
-     * carries @c avtp_timestamp and @c stream_data_length, neither of which
-     * NTSCF has. IEEE 1722 registers no subtype for RTPS, so the Experimental
-     * Format is the honest choice; set @ref avtp_subtype to the Vendor Specific
-     * Format (0x6F) or to NTSCF (0x82) if your deployment needs one of those.
+     * A stream subtype suits provisioned traffic because such a stream has one
+     * talker and its own destination address, which is what IEEE 1722 requires
+     * of streaming data: "Only one Talker is allowed per destination_address."
+     * Its header also carries @c avtp_timestamp and @c stream_data_length.
+     * IEEE 1722 registers no subtype for RTPS, so the Experimental Format is the
+     * honest choice; the Vendor Specific Format (0x6F) is the other candidate.
      */
-    static constexpr uint8_t tsn_default_subtype = 0x7F;
+    static constexpr uint8_t tsn_default_stream_subtype = 0x7F;
 
-    //! ACF message type used when @ref avtp_subtype is a control format.
+    /**
+     * Subtype for traffic with no provisioned stream: NTSCF, a control format.
+     *
+     * Discovery is inherently many-to-many --- every participant announces to
+     * the same group address --- which a stream subtype cannot represent without
+     * breaking the one-talker-per-destination rule. Control formats carry no
+     * such restriction, and many talkers on one well-known address is how IEEE
+     * 1722 control protocols such as ADP and MAAP already work.
+     */
+    static constexpr uint8_t tsn_default_control_subtype = 0x82;
+
+    //! ACF message type carrying RTPS inside a control-format PDU.
     static constexpr uint8_t tsn_default_acf_message_type = 0x78; // ACF_USER0
 
     //! Constructor
@@ -177,21 +206,46 @@ struct TSNTransportDescriptor : public PortBasedTransportDescriptor
     uint8_t socket_priority = 0;
 
     /**
-     * When true, block until the CNC has marked this node's streams as accepted
-     * before opening any output channel, for at most
-     * @ref cnc_wait_timeout_ms milliseconds.
+     * Whether traffic with no CNC-provisioned stream may still be sent.
+     *
+     * When true (the default), a destination the CNC knows nothing about is
+     * reached over @ref default_vlan_id and @ref default_pcp with a locally
+     * derived stream ID. Traffic flows, but unscheduled: the network cannot tell
+     * it apart from any other topic's, so it gets no reserved bandwidth and no
+     * traffic class. Discovery relies on this, since the CUC has no reason to
+     * provision a stream for SPDP.
+     *
+     * When false the transport is strict. It waits during initialisation for the
+     * CNC to provision and accept every stream for this node, for at most
+     * @ref cnc_wait_timeout_ms; if that expires it logs an error and refuses to
+     * start, which makes DomainParticipant creation fail. Once running it
+     * refuses to send to any destination with no provisioned stream, rather than
+     * emitting unscheduled frames. Use it where sending off-schedule is worse
+     * than not sending.
+     *
+     * @warning With this false and @ref cnc_wait_timeout_ms set to 0, creating
+     * the participant blocks until the CNC responds, with no way out but a
+     * signal.
+     */
+    bool allow_fallback = true;
+
+    /**
+     * When true, block during initialisation until the CNC has accepted this
+     * node's streams, then carry on with the defaults if it has not.
+     *
+     * Only consulted when @ref allow_fallback is true; strict mode always waits.
      */
     bool wait_for_cnc = true;
 
-    //! How long to wait for the CNC to accept the configured streams, in milliseconds.
-    uint32_t cnc_wait_timeout_ms = 10000;
-
     /**
-     * When true, do not send anything on a stream the CNC has not accepted.
-     * When false, unaccepted streams fall back to the default VLAN/PCP so that
-     * traffic still flows, un-scheduled.
+     * How long to wait for the CNC to provision and accept this node's streams,
+     * in milliseconds. 0 waits indefinitely.
+     *
+     * What expiry means depends on @ref allow_fallback: with the fallback
+     * allowed the transport carries on with the default VLAN and PCP; in strict
+     * mode it logs an error and refuses to start.
      */
-    bool require_accepted_streams = false;
+    uint32_t cnc_wait_timeout_ms = 10000;
 
     /**
      * When true, use the gPTP-disciplined clock for AVTP timestamps; when
@@ -209,10 +263,20 @@ struct TSNTransportDescriptor : public PortBasedTransportDescriptor
     //! AVTP header version, 0 or 1.
     uint8_t avtp_header_version = 0;
 
-    //! IEEE 1722 subtype used to carry RTPS messages.
-    uint8_t avtp_subtype = tsn_default_subtype;
+    /**
+     * IEEE 1722 subtype for traffic on a CNC-provisioned stream. Must be a
+     * stream subtype.
+     */
+    uint8_t stream_subtype = tsn_default_stream_subtype;
 
-    //! ACF message type used to carry RTPS messages inside the NTSCF PDU.
+    /**
+     * IEEE 1722 subtype for traffic with no provisioned stream, discovery above
+     * all. Must be a control format (NTSCF 0x82 or TSCF 0x06), so that several
+     * nodes may share one destination address.
+     */
+    uint8_t control_subtype = tsn_default_control_subtype;
+
+    //! ACF message type used to carry RTPS messages inside a control-format PDU.
     uint8_t acf_message_type = tsn_default_acf_message_type;
 
     /**

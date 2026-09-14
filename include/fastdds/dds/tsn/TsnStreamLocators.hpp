@@ -47,6 +47,14 @@ struct TsnStreamBinding
     rtps::Locator_t locator;
     //! Whether the CNC accepted this end-station interface.
     bool accepted = false;
+    /**
+     * Whether the stream has a data-frame-specification, and therefore whether
+     * @ref locator is usable. False means the CNC has not assigned the stream a
+     * destination MAC address yet.
+     */
+    bool has_destination = false;
+    //! @c interface-name of the end-station interface this entry belongs to.
+    std::string interface_name;
     //! Largest frame the CNC granted, octets. 0 when the CNC did not say.
     uint16_t max_frame_size = 0;
     //! Frames per interval the CNC granted. 0 when the CNC did not say.
@@ -81,6 +89,12 @@ public:
      * @param logical_port   RTPS logical port to place in the locators. Use the
      *                       participant's user multicast port, or 0 to let Fast
      *                       DDS fill it in.
+     *
+     * Every entry provisioned for this node is returned, including incomplete
+     * ones --- no @c station-name, or no destination MAC yet. That is
+     * deliberate: a listing that hid them would be silent in exactly the cases
+     * worth diagnosing. Check @ref TsnStreamBinding::has_destination and
+     * @ref TsnStreamBinding::topic_name before using an entry.
      *
      * @return The talker streams found. Empty when uniconf is unavailable or
      * the CNC has provisioned nothing for this node.
