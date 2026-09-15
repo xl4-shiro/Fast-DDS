@@ -30,6 +30,7 @@
 
 #include <fastdds/dds/domain/DomainParticipant.hpp>
 #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
+#include <fastdds/dds/log/Log.hpp>
 #include <fastdds/dds/publisher/DataWriter.hpp>
 #include <fastdds/dds/publisher/DataWriterListener.hpp>
 #include <fastdds/dds/publisher/Publisher.hpp>
@@ -56,10 +57,15 @@ std::atomic<bool> g_started{false};
 void signal_handler(
         int signal_number)
 {
-    // Until the participant exists we may be inside create_participant(), which
-    // with --no-fallback waits for the CNC and never looks at g_running. Asking
-    // it to stop politely would be ignored, so exit outright: a startup that
-    // cannot be interrupted is worse than an abrupt one.
+    // Until the send/receive loop is reached we may be inside a call that waits
+    // for the CNC and never looks at g_running --- create_participant(), and
+    // equally the endpoint setup below it, which waits for this topic's own
+    // stream. Asking those to stop politely would be ignored, so exit outright:
+    // a startup that cannot be interrupted is worse than an abrupt one.
+    //
+    // g_started therefore means "the loop that polls g_running is running", not
+    // "the participant exists". Setting it any earlier reintroduces a window in
+    // which the process cannot be signalled.
     if (!g_started.load())
     {
         std::_Exit(128 + signal_number);
@@ -322,10 +328,25 @@ bool find_stream(
     if (!tsn::TsnStreamLocators::find_stream_for_topic(descriptor, options.topic_name,
             talker, 0, binding))
     {
-        std::cout << "No CNC " << (talker ? "talker" : "listener") << " stream is named '"
-                  << options.topic_name << "'"
-                  << (options.allow_fallback ? "; using the participant's default locators." : ".")
-                  << std::endl;
+        // The lookup logs through Fast DDS, which writes from its own thread.
+        // Without this the library's parting error and the lines below interleave
+        // mid-sentence, exactly where the reader most needs a clear message.
+        Log::Flush();
+
+        // In strict mode the lookup has already waited for the CNC, so getting
+        // here means the wait expired rather than that the name was simply
+        // absent. Say which, or the message reads as an instant failure.
+        if (options.allow_fallback)
+        {
+            std::cout << "No CNC " << (talker ? "talker" : "listener") << " stream is named '"
+                      << options.topic_name << "'; using the participant's default locators."
+                      << std::endl;
+        }
+        else
+        {
+            std::cout << "Gave up waiting for a CNC " << (talker ? "talker" : "listener")
+                      << " stream named '" << options.topic_name << "'." << std::endl;
+        }
         return false;
     }
 
@@ -497,8 +518,6 @@ int run_publisher(
         return 1;
     }
 
-    g_started.store(true);
-
     TypeSupport type(new HelloWorldPubSubType());
     type.register_type(participant);
 
@@ -525,6 +544,8 @@ int run_publisher(
     HelloWorld sample;
     sample.message(options.payload_size > 0 ? std::string(options.payload_size, 'x') : "Hello TSN");
     uint32_t sent = 0;
+
+    g_started.store(true);
 
     while (g_running.load() && (0 == options.samples || sent < options.samples))
     {
@@ -558,8 +579,6 @@ int run_subscriber(
                   << "before the timeout." << std::endl;
         return 1;
     }
-
-    g_started.store(true);
 
     TypeSupport type(new HelloWorldPubSubType());
     type.register_type(participant);
@@ -595,6 +614,8 @@ int run_subscriber(
         }
     }
 
+    g_started.store(true);
+
     while (g_running.load() && (0 == options.samples || listener.received() < options.samples))
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -618,6 +639,13 @@ int main(
         print_usage(argv[0]);
         return 1;
     }
+
+    // Fast DDS logs only errors by default, and every diagnostic the TSN
+    // transport emits while it waits for the CNC is a warning --- so at the
+    // default level, `--no-fallback --cnc-timeout 0` blocks indefinitely without
+    // printing anything, which is indistinguishable from a hang. An example
+    // should show its working.
+    Log::SetVerbosity(Log::Warning);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);

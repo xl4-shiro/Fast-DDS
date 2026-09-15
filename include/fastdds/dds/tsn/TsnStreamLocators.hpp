@@ -111,13 +111,23 @@ public:
     /**
      * Find the stream provisioned for one topic.
      *
-     * @param descriptor    As in @ref talker_streams.
+     * Whether this blocks depends on the descriptor. With
+     * @c allow_fallback true it is a single lookup and returns false at once if
+     * the topic has no stream, because the caller has already said it is willing
+     * to run on the default locators. With @c allow_fallback false there is no
+     * such option, so it waits for the CNC to provision the stream, for up to
+     * @c cnc_wait_timeout_ms --- 0 waits indefinitely --- and returns false only
+     * once that expires.
+     *
+     * @param descriptor    As in @ref talker_streams. Its @c allow_fallback and
+     *                      @c cnc_wait_timeout_ms decide whether this waits.
      * @param topic_name    Matched against the stream's @c station-name.
      * @param talker        Search the talker list rather than the listener list.
      * @param logical_port  RTPS logical port to place in the locator.
      * @param [out] out     The binding, untouched unless this returns true.
      *
-     * @return false when no stream carries that station name.
+     * @return false when no stream carries that station name, or, in strict
+     * mode, when the wait for one expired.
      */
     FASTDDS_EXPORTED_API static bool find_stream_for_topic(
             const rtps::TSNTransportDescriptor& descriptor,

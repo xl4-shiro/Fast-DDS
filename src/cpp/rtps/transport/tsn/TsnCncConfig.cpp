@@ -459,6 +459,57 @@ bool TsnCncConfig::find_stream_for_destination(
     return false;
 }
 
+bool TsnCncConfig::wait_for_stream_named(
+        const std::string& station_name,
+        bool talker,
+        uint32_t timeout_ms,
+        TsnStream& out)
+{
+    const bool wait_forever = (0 == timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    bool reported_waiting = false;
+    auto last_report = std::chrono::steady_clock::now();
+
+    while (true)
+    {
+        TsnStream found;
+        if (find_by_station_name(station_name, talker, found) &&
+                found.accepted && found.has_data_frame_specification)
+        {
+            out = found;
+            return true;
+        }
+
+        if (!wait_forever && std::chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!reported_waiting || now - last_report >= std::chrono::seconds(5))
+        {
+            reported_waiting = true;
+            last_report = now;
+            // Name what is missing rather than just saying "waiting": a stream
+            // that exists but is unaccepted, or accepted but without a
+            // data-frame-specification, looks identical from the outside.
+            const char* why = "has not been provisioned";
+            if (found.station_name == station_name)
+            {
+                why = found.accepted ? "has no data-frame-specification yet" : "has not been accepted yet";
+            }
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "Waiting for the CNC: the " << (talker ? "talker" : "listener") << " stream named '"
+                                                << station_name << "' for cuc-id '" << cuc_id_ << "' on "
+                                                << interface_name_ << " " << why
+                                                << (wait_forever ? "; no timeout is set, so this waits indefinitely" : ""));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_STREAMS_LOOP_SLEEPMS));
+        refresh();
+    }
+}
+
 bool TsnCncConfig::find_by_station_name(
         const std::string& station_name,
         bool talker,

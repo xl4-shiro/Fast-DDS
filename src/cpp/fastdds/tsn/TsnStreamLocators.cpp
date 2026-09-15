@@ -113,7 +113,33 @@ bool TsnStreamLocators::find_stream_for_topic(
     }
 
     TsnStream stream;
-    if (!config->find_by_station_name(topic_name, talker, stream))
+    if (!descriptor.allow_fallback)
+    {
+        // Strict mode waits for this endpoint's own stream, on the same terms
+        // TSNTransport::init() waits for the node's streams: the CNC is expected
+        // to provision it, and cnc_wait_timeout_ms == 0 waits indefinitely.
+        //
+        // Without this the two disagree in a way that looks arbitrary. The
+        // transport's wait is satisfied as soon as every stream already in the
+        // datastore is accepted, whatever topics those streams serve --- so a
+        // node with an empty datastore waits, while a node that happens to carry
+        // streams for other topics passes straight through and then fails here
+        // at once. Whether an endpoint waits for its own stream would depend on
+        // whether unrelated topics had been provisioned, which is not a
+        // distinction anyone asked for.
+        if (!config->wait_for_stream_named(topic_name, talker, descriptor.cnc_wait_timeout_ms, stream))
+        {
+            EPROSIMA_LOG_ERROR(TSN_TRANSPORT,
+                    "Gave up after " << descriptor.cnc_wait_timeout_ms
+                                     << " ms waiting for the CNC to provision an accepted "
+                                     << (talker ? "talker" : "listener") << " stream named '" << topic_name
+                                     << "' for cuc-id '" << descriptor.cuc_id << "'. "
+                                     << "Raise cnc_wait_timeout_ms, set it to 0 to wait indefinitely, "
+                                     << "or allow the fallback.");
+            return false;
+        }
+    }
+    else if (!config->find_by_station_name(topic_name, talker, stream))
     {
         EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "No " << (talker ? "talker" : "listener")
                                                   << " stream is named '" << topic_name

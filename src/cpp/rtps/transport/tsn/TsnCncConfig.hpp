@@ -194,6 +194,34 @@ public:
             bool talker,
             TsnStream& out) const;
 
+    /**
+     * Wait until one named stream is provisioned, accepted and usable.
+     *
+     * @ref wait_for_accepted_streams waits for the node as a whole: it returns as
+     * soon as every stream the datastore holds for this interface is accepted,
+     * without regard to which topics those streams serve. That is the right
+     * question at transport level, but not at endpoint level --- a node whose
+     * datastore already carries streams for other topics passes it immediately,
+     * and an endpoint whose own stream has not been written yet would then give
+     * up at once while a node with an empty datastore waits patiently. This waits
+     * for the one stream that matters to the caller, so both cases behave alike.
+     *
+     * Success means the stream exists, the CNC has accepted it, and it carries a
+     * data-frame-specification --- the same three conditions the caller would
+     * otherwise have to re-check after waiting.
+     *
+     * @param station_name  @c station-name to wait for, i.e. the DDS topic name.
+     * @param talker        Search the talker list rather than the listener list.
+     * @param timeout_ms    Give up after this long. 0 waits indefinitely.
+     * @param out           The stream, on success.
+     * @return false on timeout.
+     */
+    bool wait_for_stream_named(
+            const std::string& station_name,
+            bool talker,
+            uint32_t timeout_ms,
+            TsnStream& out);
+
     //! Report the state of one end-station interface back to the CNC.
     bool report_status(
             const TsnStream& stream,

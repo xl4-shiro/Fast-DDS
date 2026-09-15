@@ -38,14 +38,17 @@ format because its header carries two things RTPS benefits from: an
 `avtp_timestamp`, filled per frame from the gPTP-disciplined clock, and an
 explicit `stream_data_length`.
 
-The 6-octet header between the AVTP header and the RTPS message covers a gap
-Annex A leaves open: **the logical ports**. Table A.1 puts the RTPS logical port
-in the locator, but the Ethernet frame has nowhere to carry it, and a
-participant's metatraffic and user traffic arrive at the same MAC address.
-Without the port on the wire there is no way to tell those channels apart.
-`rtps_length` duplicates `stream_data_length` here, and is kept so the receiver
-can validate what it got and so the control-format framing below shares the same
-header.
+The 6-octet header between the AVTP header and the RTPS message ---
+`destination_logical_port`, `source_logical_port`, `rtps_length` --- **is not
+defined by any standard.** It is specific to this implementation, it is not
+interoperable with another DDS-TSN implementation, and it contradicts the
+specification rather than extending it. See
+[Known deviations](#known-deviations-from-the-specification) for why it is here
+anyway.
+
+`rtps_length` duplicates `stream_data_length` in the stream framing, and is kept
+so the receiver can validate what it got and so the control-format framing below
+shares one header layout.
 
 ### Control-format framing
 
@@ -54,9 +57,14 @@ payload in an ACF message of type `acf_message_type` (`ACF_USER0` by default),
 which is where IEEE 1722 defines ACF messages to live. That trades the timestamp
 away, but lets RTPS share a frame with other ACF traffic such as `ACF_CAN`.
 There, `rtps_length` is load-bearing: an ACF message is padded to a quadlet
-boundary and `ACF_USERn` carries no payload length, so trailing padding would
-otherwise be indistinguishable from submessage data. The 6-octet header is sized
-so that, with the 2-octet ACF header, an RTPS message needs no padding at all.
+boundary and, `ACF_USER0` being a user-defined type, [1722] specifies no payload
+length or `pad` field for it, so trailing padding would otherwise be
+indistinguishable from submessage data. A two-bit `pad` field, as subclause
+9.4.1.7 defines for the standardized ACF message types, would have been the more
+idiomatic way to record this --- see
+[Known deviations](#known-deviations-from-the-specification). The 6-octet header
+is sized so that, with the 2-octet ACF header, an RTPS message needs no padding
+at all.
 
 ## Building
 
@@ -181,6 +189,13 @@ and on the listener node:
 ./tsn subscriber -i eth0 -t ControlCommand --cuc-id br01 --uniconf-db /var/lib/uniconf.db
 ```
 
+`ControlCommand` is just a name --- nothing in the code requires it, and `-t`
+defaults to `HelloWorldTopic`. What matters is that the topic name matches the
+`station-name` the CUC provisioned for this interface, on both nodes, because
+that is how the stream is found. Rename it to anything you like, as long as `-t`
+and `station-name` change together; drop `-t` entirely and provision the
+station-name as `HelloWorldTopic`.
+
 Run `./tsn` with no arguments for the full option list.
 
 ## How the streams are configured
@@ -223,8 +238,17 @@ worse than not sending. Two things then change:
   accept every stream for this node, for at most `cnc_wait_timeout_ms`
   (`--cnc-timeout`, default 10000). If that expires it logs an error and refuses
   to start, which makes `create_participant()` fail and return `nullptr`.
-- An endpoint whose topic has no provisioned stream is refused at creation,
-  rather than quietly sending on the participant's own locators.
+- An endpoint whose topic has no provisioned stream waits for that specific
+  stream, on the same terms, and is refused at creation only once the wait
+  expires --- rather than quietly sending on the participant's own locators.
+
+  The endpoint waits for *its own* stream, not merely for the node to have some
+  accepted stream. The two differ whenever a datastore already holds entries for
+  other topics: the transport's check above is satisfied by those, so without a
+  second, topic-specific wait an endpoint would give up instantly on a populated
+  datastore while waiting patiently on an empty one. Whether an endpoint waited
+  would depend on whether unrelated topics happened to be provisioned, which is
+  not a useful distinction.
 
 Discovery is deliberately *not* blocked. It is framed as a control format, not a
 stream, so there is nothing to schedule and nothing to refuse --- which is what
@@ -245,16 +269,21 @@ endpoint serves, and is the only layer that can.
 `cnc_wait_timeout_ms` governs both modes; only the consequence of expiry
 differs:
 
-|                                   | timeout expires                              |
-|-----------------------------------+----------------------------------------------|
+| | timeout expires |
+|---|---|
 | `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP |
-| `allow_fallback = false`          | error, transport does not start,             |
-|                                   | participant creation fails                   |
+| `allow_fallback = false` | error; the transport does not start and participant creation fails, or, for an endpoint whose topic was never provisioned, the endpoint is refused |
 
 A timeout of **0 waits indefinitely**. In strict mode that means participant
-creation does not return until the CNC responds, and the process can only be
-stopped by a signal --- the example exits immediately on SIGINT/SIGTERM while
-still starting up, rather than appearing to hang.
+creation, and then endpoint creation, do not return until the CNC responds, and
+the process can only be stopped by a signal --- the example exits immediately on
+SIGINT/SIGTERM while still starting up, rather than appearing to hang.
+
+Both waits report every five seconds which stream they are still waiting for and
+why --- not provisioned, not accepted, or accepted without a
+data-frame-specification. Those are warnings, and Fast DDS logs only errors by
+default, so the example raises the verbosity to `Log::Warning` at startup. An
+application that does not will see an indefinite wait produce no output at all.
 
 ## QoS
 
@@ -417,3 +446,50 @@ re-registers itself when the preference changes.
 
 - **EtherType.** Frames use `0x22F0` (IEEE 1722). The specification registers no
   EtherType for RTPS and only notes that a future version may.
+
+- **A 6-octet header in front of the RTPS message.** Subclause A.5 is explicit
+  that there should be nothing there:
+
+  > When RTPS operates over Ethernet, a Message is the contents (payload) of
+  > exactly one Ethernet frame.
+
+  and A.4.1 adds that a Message's length "is not sent explicitly by the
+  DDSI-RTPS protocol", being "the length of the Ethernet frame's payload". This
+  implementation sends both a length and two logical ports.
+
+  The reason is that Annex A does not close its own loop. A.6.1 requires
+  Endpoints to use the logical port expressions of [DDSI-RTPS] Tables 9.8 and
+  9.9, and Table A.1 carries the port inside the locator, so a receiver is
+  expected to distinguish a participant's metatraffic channel from its user
+  traffic --- both of which arrive at the same MAC address. Yet A.5 leaves no
+  field in which the port could travel. Something has to give, and this
+  implementation chose to add the port rather than collapse the channels.
+
+  `rtps_length` is the second departure. A.5's rule works because the RTPS
+  message is the whole payload; here it is not, since the message sits inside an
+  AVTP PDU. In the control framing something must record the exact length: an ACF
+  message is padded to a quadlet boundary, and `ACF_USER0` is a user-defined
+  type, so [1722] specifies no payload length or `pad` field for it --- unlike
+  the message types of subclause 9.4.1.7, each of which carries its own `pad`.
+  Trailing padding would otherwise be indistinguishable from submessage data.
+
+  Being user-defined cuts both ways, though: the layout of an `ACF_USERn`
+  payload is ours to choose, so the idiomatic answer would have been to follow
+  the same convention as every other ACF message and spend **two bits on a
+  `pad` field**, rather than sixteen on a byte count. That would say the same
+  thing in 1722's own vocabulary and shorten the header. `rtps_length` is
+  therefore a defensible choice but not the natural one, and a future revision
+  of this transport should prefer the `pad` field.
+
+  A future revision of [DDS-TSN] that defines an RTPS EtherType would presumably
+  also say how the logical port travels. Until then, treat this header as a
+  local convention: both ends of a link must run this transport.
+
+## References
+
+| Tag | Document |
+|---|---|
+| [DDS-TSN] | OMG, *DDS Extensions for Time Sensitive Networking*, v1.0 beta, ptc/2023-03-03 |
+| [DDSI-RTPS] | OMG, *Real-Time Publish-Subscribe Protocol DDS Interoperability Wire Protocol*, v2.5, formal/2022-04-01 |
+| [1722] | IEEE Std 1722-2025, *Standard for a Transport Protocol for Time-Sensitive Applications in Bridged Local Area Networks* |
+| [802.1Qcc] | IEEE Std 802.1Qcc-2018, and the `ieee802-dot1q-cnc-config` YANG module it defines |
