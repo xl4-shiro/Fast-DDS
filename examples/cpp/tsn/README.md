@@ -477,6 +477,40 @@ re-registers itself when the preference changes.
   also say how the logical port travels. Until then, treat this header as a local
   convention: both ends of a link must run this transport.
 
+## Adapting to a future revision
+
+Version 1.0 of [DDS-TSN] leaves enough unsaid that two independent
+implementations are unlikely to interoperate: A.5 provides no field for the
+logical port that A.6.1 requires, A.6.1.4.1 gives a multicast address that is not
+a well-formed MAC address, and no EtherType is registered. Every deviation listed
+above follows from one of those gaps. The aim here is therefore not
+interoperability today, but staying cheap to correct when the specification
+settles.
+
+What that costs, per decision:
+
+| Decision | To change it | Cost |
+|---|---|---|
+| Stream and control subtypes, ACF message type | `stream_subtype`, `control_subtype`, `acf_message_type` | runtime, no rebuild |
+| Default multicast MAC, VLAN, PCP | `default_multicast_mac`, `default_vlan_id`, `default_pcp` | runtime, no rebuild |
+| Framing header sizes | `TsnFraming` | one struct |
+| The 2-octet TSN-RTPS header | `TsnRtpsHeader` plus its two call sites in `AvtpStream` | one file, two uses |
+| Locator layout (Table A.1) | `EthernetLocator` | one class, public API |
+| EtherType `0x22F0` | not ours --- `avtpcon` sets it | a registered RTPS EtherType would drop the 1722 framing entirely, and with it most of this transport's reason to exist in its present shape |
+
+The framing sizes are worth a note. `AvtpStream` sizes its buffers per stream
+from `avtpcon_get_max_payload_size()`, which is authoritative, while
+`TSNTransport` caps the participant's message size up front from the interface
+MTU --- before any stream exists. Those are two expressions of the same framing,
+and they were two independent sets of literals until one of them was left behind
+by a change to the header size. They now share `TsnFraming`, so a future revision
+moves one struct rather than hunting for constants.
+
+What is deliberately *not* abstracted: there is no version negotiation and no
+capability exchange. Both ends of a link must run the same build. Adding a
+framing-version field would be speculation about a specification that does not
+exist yet, and the field itself would become another deviation to unwind.
+
 ## References
 
 | Tag | Document |

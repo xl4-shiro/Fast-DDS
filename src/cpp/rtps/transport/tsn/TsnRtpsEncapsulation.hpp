@@ -116,6 +116,44 @@ struct TsnRtpsHeader
     static constexpr uint16_t min_rtps_message_size = 20u;
 };
 
+/**
+ * Octet sizes of the framing an RTPS message is wrapped in.
+ *
+ * Gathered here because they are the parts most likely to move when [DDS-TSN]
+ * settles the questions its first version leaves open --- a registered EtherType
+ * would remove the 1722 headers entirely, and a defined encapsulation would
+ * replace @ref TsnRtpsHeader. Two places need these numbers: AvtpStream, which
+ * sizes its buffers per stream, and TSNTransport, which caps the participant's
+ * message size before a message is ever built. Keeping a private copy in each
+ * is how they drift apart.
+ */
+struct TsnFraming
+{
+    //! AVTP stream header: subtype, stream id, timestamp, data length.
+    static constexpr uint32_t avtp_stream_header = 24u;
+    //! AVTP control header (NTSCF/TSCF): subtype, data length, stream id.
+    static constexpr uint32_t avtp_control_header = 12u;
+    //! ACF message header: msg_type and length in quadlets.
+    static constexpr uint32_t acf_header = 2u;
+    //! 802.1Q tag, always present since a TSN stream is VLAN-tagged.
+    static constexpr uint32_t vlan_tag = 4u;
+
+    /**
+     * Worst-case octets between the Ethernet payload and the RTPS message.
+     *
+     * One participant sends discovery on the control format and user data on a
+     * stream subtype, and a single maximum message size has to fit both, so this
+     * takes the larger of the two.
+     */
+    static constexpr uint32_t worst_case_overhead()
+    {
+        return vlan_tag + TsnRtpsHeader::size +
+               (avtp_control_header + acf_header > avtp_stream_header
+                        ? avtp_control_header + acf_header
+                        : avtp_stream_header);
+    }
+};
+
 //! Whether @c buffer starts with the RTPS protocol magic, "RTPS".
 inline bool has_rtps_magic(
         const uint8_t* buffer,

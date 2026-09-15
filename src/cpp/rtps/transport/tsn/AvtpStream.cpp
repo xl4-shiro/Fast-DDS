@@ -38,7 +38,7 @@ namespace rtps {
 namespace tsn {
 
 //! Octets the ACF layer prepends to our own header: the ACF type_length field.
-static constexpr uint32_t acf_header_size = 2u;
+static constexpr uint32_t acf_header_size = TsnFraming::acf_header;
 
 /**
  * Whether this subtype carries its payload as ACF messages.

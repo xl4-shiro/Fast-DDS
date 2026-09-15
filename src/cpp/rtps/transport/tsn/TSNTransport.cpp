@@ -103,18 +103,7 @@ uint32_t TSNTransport::max_rtps_message_for_interface() const
     // between it and the payload. AvtpStream recomputes this per stream from
     // what the socket reports; this is the same arithmetic applied up front, so
     // Fast DDS never builds a message the stream would have to drop.
-    constexpr uint32_t vlan_tag_size = 4u;
-    constexpr uint32_t stream_header_size = 24u;
-    constexpr uint32_t control_header_size = 12u;
-    constexpr uint32_t acf_header_size = 2u;
-    constexpr uint32_t rtps_header_size = tsn::TsnRtpsHeader::size;
-
-    // Take the larger of the two framings: the same participant sends discovery
-    // on the control format and user data on a stream subtype, and one maximum
-    // message size has to fit both.
-    const uint32_t control_overhead = control_header_size + acf_header_size;
-    uint32_t overhead = vlan_tag_size + rtps_header_size;
-    overhead += std::max(control_overhead, stream_header_size);
+    const uint32_t overhead = tsn::TsnFraming::worst_case_overhead();
 
     if (interface_mtu_ <= overhead)
     {
