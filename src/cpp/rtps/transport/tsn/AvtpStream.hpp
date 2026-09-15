@@ -105,8 +105,6 @@ struct AvtpReceivedMessage
 {
     //! Logical port the message is addressed to.
     uint16_t destination_logical_port = 0;
-    //! Logical port of the sender.
-    uint16_t source_logical_port = 0;
     //! Length of the RTPS message written into the caller's buffer.
     uint32_t rtps_length = 0;
     //! Stream ID carried by the NTSCF header.
@@ -151,15 +149,13 @@ public:
      * @param buffers                    Slices making up the RTPS message.
      * @param total_bytes                Sum of the slice sizes.
      * @param destination_logical_port   Logical port of the destination locator.
-     * @param source_logical_port        Logical port announced as the source.
      *
      * @return true when the whole message was handed to the socket.
      */
     bool send(
             const std::vector<NetworkBuffer>& buffers,
             uint32_t total_bytes,
-            uint16_t destination_logical_port,
-            uint16_t source_logical_port);
+            uint16_t destination_logical_port);
 
     /**
      * Receive one frame and extract the RTPS message it carries.

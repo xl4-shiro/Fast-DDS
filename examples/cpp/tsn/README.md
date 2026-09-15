@@ -26,7 +26,7 @@ DataWriter::write()
 | stream_id (8)                  | avtp_timestamp (4)   |                       |              |
 | stream_data_length (2)         |                      |                       |              |
 |--------------------------------+----------------------+-----------------------+--------------|
-| dst logical port (2)           | src logical port (2) | rtps_length(2)        |              |
+| dst logical port (2)           |                      |                       |              |
 |--------------------------------+----------------------+-----------------------+--------------|
 | RTPS message                   |                      |                       |              |
 |--------------------------------+----------------------+-----------------------+--------------|
@@ -38,17 +38,17 @@ format because its header carries two things RTPS benefits from: an
 `avtp_timestamp`, filled per frame from the gPTP-disciplined clock, and an
 explicit `stream_data_length`.
 
-The 6-octet header between the AVTP header and the RTPS message ---
-`destination_logical_port`, `source_logical_port`, `rtps_length` --- **is not
-defined by any standard.** It is specific to this implementation, it is not
-interoperable with another DDS-TSN implementation, and it contradicts the
-specification rather than extending it. See
-[Known deviations](#known-deviations-from-the-specification) for why it is here
-anyway.
+The 2-octet header between the AVTP header and the RTPS message --- a single
+`destination_logical_port` --- **is not defined by any standard.** It is specific
+to this implementation, it is not interoperable with another DDS-TSN
+implementation, and it contradicts the specification rather than extending it.
+See [Known deviations](#known-deviations-from-the-specification) for why it is
+here anyway.
 
-`rtps_length` duplicates `stream_data_length` in the stream framing, and is kept
-so the receiver can validate what it got and so the control-format framing below
-shares one header layout.
+It carries the port and nothing else. The message *length* is already on the
+wire, in `stream_data_length` here and `acf_msg_length` under the control
+framing, and a *source* port is not needed because RTPS replies to the locators a
+peer announced in discovery rather than to wherever a message came from.
 
 ### Control-format framing
 
@@ -56,15 +56,11 @@ Setting `avtp_subtype` to NTSCF (0x82) or TSCF (0x06) instead wraps the same
 payload in an ACF message of type `acf_message_type` (`ACF_USER0` by default),
 which is where IEEE 1722 defines ACF messages to live. That trades the timestamp
 away, but lets RTPS share a frame with other ACF traffic such as `ACF_CAN`.
-There, `rtps_length` is load-bearing: an ACF message is padded to a quadlet
-boundary and, `ACF_USER0` being a user-defined type, [1722] specifies no payload
-length or `pad` field for it, so trailing padding would otherwise be
-indistinguishable from submessage data. A two-bit `pad` field, as subclause
-9.4.1.7 defines for the standardized ACF message types, would have been the more
-idiomatic way to record this --- see
-[Known deviations](#known-deviations-from-the-specification). The 6-octet header
-is sized so that, with the 2-octet ACF header, an RTPS message needs no padding
-at all.
+An ACF message is padded to a quadlet boundary, and `ACF_USER0` being a
+user-defined type, [1722] specifies no `pad` field for it --- but none is needed.
+An RTPS message is always a multiple of 4 octets, so the 2-octet ACF header plus
+this 2-octet header leave the ACF message quadlet-aligned with nothing to pad,
+and `acf_msg_length` therefore gives the message length exactly.
 
 ## Building
 
@@ -298,7 +294,7 @@ specification recommends for a time-critical stream:
 
 Keep samples small enough that one RTPS message fits one Ethernet frame. The
 transport reads the interface MTU at startup and caps the participant's maximum
-message size to what actually fits — roughly 1466 octets on a 1500-octet MTU
+message size to what actually fits — roughly 1468 octets on a 1500-octet MTU
 with the stream framing above. Larger samples still work: RTPS fragments them
 into `DataFrag` submessages, which is what subclause 8.2.1 expects, but the
 schedule then has to account for several frames per sample.
@@ -447,15 +443,13 @@ re-registers itself when the preference changes.
 - **EtherType.** Frames use `0x22F0` (IEEE 1722). The specification registers no
   EtherType for RTPS and only notes that a future version may.
 
-- **A 6-octet header in front of the RTPS message.** Subclause A.5 is explicit
+- **A 2-octet header in front of the RTPS message.** Subclause A.5 is explicit
   that there should be nothing there:
 
   > When RTPS operates over Ethernet, a Message is the contents (payload) of
   > exactly one Ethernet frame.
 
-  and A.4.1 adds that a Message's length "is not sent explicitly by the
-  DDSI-RTPS protocol", being "the length of the Ethernet frame's payload". This
-  implementation sends both a length and two logical ports.
+  This implementation puts a `destination_logical_port` there.
 
   The reason is that Annex A does not close its own loop. A.6.1 requires
   Endpoints to use the logical port expressions of [DDSI-RTPS] Tables 9.8 and
@@ -465,25 +459,23 @@ re-registers itself when the preference changes.
   field in which the port could travel. Something has to give, and this
   implementation chose to add the port rather than collapse the channels.
 
-  `rtps_length` is the second departure. A.5's rule works because the RTPS
-  message is the whole payload; here it is not, since the message sits inside an
-  AVTP PDU. In the control framing something must record the exact length: an ACF
-  message is padded to a quadlet boundary, and `ACF_USER0` is a user-defined
-  type, so [1722] specifies no payload length or `pad` field for it --- unlike
-  the message types of subclause 9.4.1.7, each of which carries its own `pad`.
-  Trailing padding would otherwise be indistinguishable from submessage data.
+  The stream ID cannot stand in for it. A talker is keyed on destination MAC,
+  VLAN and PCP alone, so one stream serves every logical port heading to the same
+  address: in the no-CNC fallback SPDP and user multicast share the default
+  multicast MAC and therefore one stream ID, and under RELIABLE QoS a reader's
+  ACKNACKs reach the writer's user port at the MAC already carrying SEDP.
 
-  Being user-defined cuts both ways, though: the layout of an `ACF_USERn`
-  payload is ours to choose, so the idiomatic answer would have been to follow
-  the same convention as every other ACF message and spend **two bits on a
-  `pad` field**, rather than sixteen on a byte count. That would say the same
-  thing in 1722's own vocabulary and shorten the header. `rtps_length` is
-  therefore a defensible choice but not the natural one, and a future revision
-  of this transport should prefer the `pad` field.
+  Nothing else is carried. A.4.1 says a Message's length "is not sent explicitly
+  by the DDSI-RTPS protocol", and it is not sent here either: an RTPS message is
+  always a multiple of 4 octets, so `stream_data_length` bounds it exactly under
+  a stream subtype, and under a control subtype the 2-octet ACF header plus this
+  2-octet header leave the ACF message quadlet-aligned, making `acf_msg_length`
+  exact too. A source port is not carried because RTPS replies to the locators a
+  peer announced in discovery, not to where a message arrived from.
 
   A future revision of [DDS-TSN] that defines an RTPS EtherType would presumably
-  also say how the logical port travels. Until then, treat this header as a
-  local convention: both ends of a link must run this transport.
+  also say how the logical port travels. Until then, treat this header as a local
+  convention: both ends of a link must run this transport.
 
 ## References
 

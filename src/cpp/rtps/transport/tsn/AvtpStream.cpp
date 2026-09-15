@@ -249,8 +249,7 @@ void AvtpStream::disable()
 bool AvtpStream::send(
         const std::vector<NetworkBuffer>& buffers,
         uint32_t total_bytes,
-        uint16_t destination_logical_port,
-        uint16_t source_logical_port)
+        uint16_t destination_logical_port)
 {
     if (!enabled_.load() || nullptr == connection_)
     {
@@ -289,8 +288,6 @@ bool AvtpStream::send(
 
     TsnRtpsHeader header;
     header.destination_logical_port = destination_logical_port;
-    header.source_logical_port = source_logical_port;
-    header.rtps_length = static_cast<uint16_t>(offset);
     header.serialize(staging);
 
     int encoded = static_cast<int>(TsnRtpsHeader::size + offset);
@@ -371,31 +368,31 @@ bool AvtpStream::receive(
     }
 
     TsnRtpsHeader header;
-    if (!header.deserialize(encapsulated, encapsulated_size))
+    uint32_t rtps_length = 0;
+    if (!header.deserialize(encapsulated, encapsulated_size, rtps_length))
     {
         EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding a PDU with a malformed RTPS header");
         return false;
     }
 
     const uint8_t* const rtps_message = encapsulated + TsnRtpsHeader::size;
-    if (!has_rtps_magic(rtps_message, header.rtps_length))
+    if (!has_rtps_magic(rtps_message, rtps_length))
     {
         EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding a PDU that does not carry an RTPS message");
         return false;
     }
 
-    if (header.rtps_length > capacity)
+    if (rtps_length > capacity)
     {
-        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding RTPS message of " << header.rtps_length
+        EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Discarding RTPS message of " << rtps_length
                                                                           << " octets, larger than the "
                                                                           << capacity << " octet receive buffer");
         return false;
     }
 
-    memcpy(buffer, rtps_message, header.rtps_length);
+    memcpy(buffer, rtps_message, rtps_length);
     out.destination_logical_port = header.destination_logical_port;
-    out.source_logical_port = header.source_logical_port;
-    out.rtps_length = header.rtps_length;
+    out.rtps_length = rtps_length;
     out.vlan_id = avtpcon_rec_vid(connection_);
 
     // Subclause 7.3.3 of [DDS-TSN] puts the talker node's MAC address in the

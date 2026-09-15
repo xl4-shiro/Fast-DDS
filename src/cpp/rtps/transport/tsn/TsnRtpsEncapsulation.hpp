@@ -32,46 +32,45 @@ namespace tsn {
 /**
  * Header prefixed to an RTPS message inside an IEEE 1722 PDU payload.
  *
- * Annex A of [DDS-TSN] maps RTPS onto Ethernet but leaves two things
- * unspecified that a receiver needs in order to demultiplex:
+ * Annex A of [DDS-TSN] maps RTPS onto Ethernet but leaves one thing unspecified
+ * that a receiver needs in order to demultiplex: the RTPS *logical port*. The
+ * locator carries it (Table A.1) and A.6.1 requires endpoints to use the port
+ * expressions of [DDSI-RTPS], yet the Ethernet frame has no field to put it in,
+ * and a node's metatraffic and user traffic reach the same MAC address.
  *
- *  - The RTPS *logical port*. The locator carries it (Table A.1) but the
- *    Ethernet frame has no field to put it in, and a node's metatraffic and
- *    user traffic reach the same MAC address. Both ports travel here instead.
+ * The stream ID cannot stand in for it. A talker is keyed on destination MAC,
+ * VLAN and PCP alone, so one stream serves every logical port heading to the
+ * same address --- in the no-CNC fallback, SPDP and user multicast share the
+ * default multicast MAC and therefore share a stream ID, and under RELIABLE QoS
+ * a reader's ACKNACKs reach the writer's user port at the MAC already carrying
+ * SEDP. Nothing but the port separates those.
  *
- *  - The exact message length. Under a stream subtype the AVTP header's
- *    @c stream_data_length already gives it, but under a control subtype the
- *    ACF message is padded to a quadlet boundary and @c ACF_USERn carries no
- *    payload length, so trailing padding would be indistinguishable from
- *    submessage data. Carrying the length here keeps one framing for both and
- *    lets the receiver validate what it got.
+ * Nothing else needs to travel here:
  *
- * The header is 6 octets, so that with the 2-octet ACF header in front of it an
- * RTPS message (always a multiple of 4 octets, since every submessage is
- * aligned on a 32-bit boundary) needs no ACF padding at all.
+ *  - The *length* is already on the wire. Under a stream subtype the AVTP
+ *    header's @c stream_data_length gives it; under a control subtype an RTPS
+ *    message is always a multiple of 4 octets, so this 2-octet header behind the
+ *    2-octet ACF header leaves the ACF message quadlet-aligned with no padding,
+ *    and @c acf_msg_length gives it exactly.
+ *
+ *  - The *source* port is not needed to route a reply. RTPS sends to the
+ *    locators a peer announced in discovery, not to where a datagram came from.
  *
  * @code
- * 0...............8..............16..............24..............31
- * +---------------+---------------+---------------+---------------+
- * |   destination logical port    |     source logical port       |
- * +---------------+---------------+---------------+---------------+
- * |          rtps_length          |  RTPS message ...
- * +---------------+---------------+-------------------------------+
+ * 0...............8..............15
+ * +---------------+---------------+
+ * |   destination logical port    |  RTPS message ...
+ * +---------------+---------------+
  * @endcode
  *
- * All fields are big endian, matching the byte order of every other IEEE 1722
- * header field.
+ * Big endian, matching every other IEEE 1722 header field.
  */
 struct TsnRtpsHeader
 {
-    static constexpr uint32_t size = 6u;
+    static constexpr uint32_t size = 2u;
 
     //! Logical port of the destination locator the message is addressed to.
     uint16_t destination_logical_port = 0;
-    //! Logical port of the sending participant, used to build the remote locator.
-    uint16_t source_logical_port = 0;
-    //! Length in octets of the RTPS message that follows.
-    uint16_t rtps_length = 0;
 
     //! Serialize into @c buffer, which must have room for @ref size octets.
     void serialize(
@@ -79,35 +78,35 @@ struct TsnRtpsHeader
     {
         buffer[0] = static_cast<uint8_t>(destination_logical_port >> 8);
         buffer[1] = static_cast<uint8_t>(destination_logical_port & 0xFF);
-        buffer[2] = static_cast<uint8_t>(source_logical_port >> 8);
-        buffer[3] = static_cast<uint8_t>(source_logical_port & 0xFF);
-        buffer[4] = static_cast<uint8_t>(rtps_length >> 8);
-        buffer[5] = static_cast<uint8_t>(rtps_length & 0xFF);
     }
 
     /**
-     * Deserialize from @c buffer.
+     * Deserialize from @c buffer and report the length of the message behind it.
      *
-     * @param buffer     Start of the ACF message payload.
-     * @param available  Octets available in @c buffer, padding included.
+     * @param buffer       Start of the encapsulated payload.
+     * @param available    Octets available in @c buffer.
+     * @param [out] rtps_length  Length of the RTPS message following the header.
      *
-     * @return true when the header is complete and the announced RTPS message
-     * fits in @c available.
+     * @return true when the header is complete and a plausible RTPS message
+     * follows it.
      */
     bool deserialize(
             const uint8_t* buffer,
-            uint32_t available)
+            uint32_t available,
+            uint32_t& rtps_length)
     {
-        if (available < size)
+        if (available < size + min_rtps_message_size)
         {
             return false;
         }
         destination_logical_port = static_cast<uint16_t>((buffer[0] << 8) | buffer[1]);
-        source_logical_port = static_cast<uint16_t>((buffer[2] << 8) | buffer[3]);
-        rtps_length = static_cast<uint16_t>((buffer[4] << 8) | buffer[5]);
 
-        return rtps_length >= min_rtps_message_size &&
-               static_cast<uint32_t>(rtps_length) + size <= available;
+        // Whatever follows the header is the message: the framing below already
+        // bounded it, exactly under a stream subtype and to a quadlet under a
+        // control subtype, where an RTPS message's own 4-octet alignment means
+        // the bound is exact too.
+        rtps_length = available - size;
+        return true;
     }
 
     /**

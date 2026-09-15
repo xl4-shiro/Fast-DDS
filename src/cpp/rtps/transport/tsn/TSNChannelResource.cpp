@@ -157,9 +157,12 @@ void TSNChannelResource::perform_listen_operation()
         // sender's address appears once the raw socket has handed us the frame.
         MacAddress remote_mac;
         memcpy(remote_mac.data(), message.stream_id.data(), 6);
+        // No source port: the framing does not carry one, because RTPS replies
+        // to the locators a peer announced in discovery rather than to where a
+        // message came from. Fast DDS uses this locator only to attribute
+        // network statistics, which the MAC address already identifies.
         const Locator remote_locator = EthernetLocator::create_locator(
-            remote_mac, message.vlan_id, EthernetLocator::pcp(input_locator),
-            message.source_logical_port);
+            remote_mac, message.vlan_id, EthernetLocator::pcp(input_locator), 0);
 
         receiver->OnDataReceived(msg.buffer, msg.length, input_locator, remote_locator);
     }

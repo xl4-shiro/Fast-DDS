@@ -31,6 +31,7 @@
 #include <fastdds/rtps/common/PortParameters.hpp>
 
 #include <rtps/transport/tsn/TSNSenderResource.hpp>
+#include <rtps/transport/tsn/TsnRtpsEncapsulation.hpp>
 #include <rtps/transport/tsn/Xl4Runtime.hpp>
 
 extern "C" {
@@ -106,7 +107,7 @@ uint32_t TSNTransport::max_rtps_message_for_interface() const
     constexpr uint32_t stream_header_size = 24u;
     constexpr uint32_t control_header_size = 12u;
     constexpr uint32_t acf_header_size = 2u;
-    constexpr uint32_t rtps_header_size = 6u; // tsn::TsnRtpsHeader::size
+    constexpr uint32_t rtps_header_size = tsn::TsnRtpsHeader::size;
 
     // Take the larger of the two framings: the same participant sends discovery
     // on the control format and user data on a stream subtype, and one maximum
@@ -309,7 +310,7 @@ bool TSNTransport::transform_remote_locator(
 Locator TSNTransport::local_locator() const
 {
     return EthernetLocator::create_locator(local_mac_, configuration_.default_vlan_id,
-                   configuration_.default_pcp, source_logical_port_.load());
+                   configuration_.default_pcp, local_logical_port_.load());
 }
 
 TSNTransport::ListenerKey TSNTransport::listener_key(
@@ -503,7 +504,6 @@ bool TSNTransport::send(
     }
 
     bool sent_to_any = false;
-    const uint16_t source_port = source_logical_port_.load();
 
     LocatorsIterator& it = *destination_locators_begin;
     while (it != *destination_locators_end)
@@ -515,7 +515,7 @@ bool TSNTransport::send(
             if (nullptr != talker)
             {
                 sent_to_any |= talker->send(buffers, total_bytes,
-                                EthernetLocator::logical_port(locator), source_port);
+                                EthernetLocator::logical_port(locator));
             }
         }
         ++it;
@@ -564,12 +564,12 @@ bool TSNTransport::OpenInputChannel(
         return false;
     }
 
-    // Announce the first unicast port we listen on as the source of our
-    // outgoing messages, so remote locators built by peers point back here.
+    // Remember the first unicast port we listen on, so local_locator() can
+    // describe this transport with something better than port zero.
     if (!EthernetLocator::is_multicast(locator))
     {
         uint16_t expected = 0;
-        source_logical_port_.compare_exchange_strong(expected, EthernetLocator::logical_port(locator));
+        local_logical_port_.compare_exchange_strong(expected, EthernetLocator::logical_port(locator));
     }
 
     return true;

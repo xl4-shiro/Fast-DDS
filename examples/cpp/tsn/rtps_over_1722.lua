@@ -24,11 +24,11 @@
 -- Two framings are decoded, matching the transport:
 --
 --   stream subtype (EF_STREAM 0x7F by default), for CNC-provisioned streams:
---     [ AVTP stream header, 24 octets ][ TSN-RTPS header, 6 ][ RTPS message ]
+--     [ AVTP stream header, 24 octets ][ TSN-RTPS header, 2 ][ RTPS message ]
 --
 --   control format (NTSCF 0x82 / TSCF 0x06), for discovery and anything with
 --   no provisioned stream:
---     [ control header, 12 ][ ACF header, 2 ][ TSN-RTPS header, 6 ][ RTPS ]
+--     [ control header, 12 ][ ACF header, 2 ][ TSN-RTPS header, 2 ][ RTPS ]
 --
 -- The RTPS message itself is handed to Wireshark's own "rtps" dissector, so
 -- submessages, GUIDs and QoS decode as usual.
@@ -78,8 +78,7 @@ local f = {
     acf_type   = ProtoField.uint8("tsnrtps.acf_type", "ACF Message Type", base.HEX),
     acf_quads  = ProtoField.uint16("tsnrtps.acf_quadlets", "ACF Length (quadlets)", base.DEC),
     dport      = ProtoField.uint16("tsnrtps.dst_port", "Destination logical port", base.DEC),
-    sport      = ProtoField.uint16("tsnrtps.src_port", "Source logical port", base.DEC),
-    rtps_len   = ProtoField.uint16("tsnrtps.rtps_length", "RTPS length", base.DEC),
+    rtps_len   = ProtoField.uint32("tsnrtps.rtps_length", "RTPS length (derived)", base.DEC),
 }
 p_tsn.fields = f
 
@@ -135,8 +134,15 @@ local function builtin_kinds()
     return table.concat(names, "+")
 end
 
---- Add the 6-octet header the transport puts in front of every RTPS message,
+--- Add the 2-octet header the transport puts in front of every RTPS message,
 --- and hand the message itself to the RTPS dissector.
+---
+--- The header carries only the destination logical port. The length is not on
+--- the wire: an RTPS message is always a multiple of 4 octets, so the framing
+--- around it bounds it exactly --- stream_data_length under a stream subtype,
+--- and acf_msg_length under a control subtype, where the 2-octet ACF header
+--- plus this 2-octet header keep the ACF message quadlet-aligned with no
+--- padding.
 ---
 --- @param offset  where the TSN-RTPS header starts within tvb
 --- @param framing "stream" or "control", for the info column
@@ -146,32 +152,19 @@ end
 ---                --- and the frame may not be ours at all.
 --- @return true when an RTPS message was decoded
 local function dissect_rtps_payload(tvb, pinfo, tree, offset, framing, quiet)
-    if tvb:len() < offset + 6 then
-        if not quiet then
-            tree:add_proto_expert_info(e_len, "Truncated before the TSN-RTPS header")
-        end
-        return false
-    end
-
-    local hdr = tree:add(p_tsn, tvb(offset, 6), "TSN-RTPS header")
-    hdr:add(f.dport, tvb(offset, 2))
-    hdr:add(f.sport, tvb(offset + 2, 2))
-    local len_item = hdr:add(f.rtps_len, tvb(offset + 4, 2))
-    local rtps_len = tvb(offset + 4, 2):uint()
-
-    local available = tvb:len() - (offset + 6)
-    if rtps_len > available then
-        if not quiet then
-            len_item:add_proto_expert_info(e_len,
-                string.format("declares %d octets, %d available", rtps_len, available))
-        end
-        rtps_len = available
-    end
+    local rtps_len = tvb:len() - (offset + 2)
     if rtps_len < 20 then
+        if not quiet then
+            tree:add_proto_expert_info(e_len, "Truncated before the RTPS message")
+        end
         return false
     end
 
-    local rtps_tvb = tvb(offset + 6, rtps_len):tvb()
+    local hdr = tree:add(p_tsn, tvb(offset, 2), "TSN-RTPS header")
+    hdr:add(f.dport, tvb(offset, 2))
+    hdr:add(f.rtps_len, tvb(offset + 2, rtps_len), rtps_len):set_generated()
+
+    local rtps_tvb = tvb(offset + 2, rtps_len):tvb()
     if rtps_tvb(0, 4):string() ~= "RTPS" then
         if not quiet then
             tree:add_proto_expert_info(e_rtps)

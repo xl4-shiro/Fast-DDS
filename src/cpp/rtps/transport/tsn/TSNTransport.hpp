@@ -282,11 +282,15 @@ private:
     uint16_t next_stream_unique_id_ = 1;
 
     /**
-     * Logical port announced as the source of outgoing messages. Set from the
-     * first unicast input channel opened, which is the participant's
-     * metatraffic unicast port.
+     * Logical port used to describe this transport's own locator.
+     *
+     * Set from the first unicast input channel opened, which is the
+     * participant's metatraffic unicast port. It is not put on the wire --- the
+     * framing carries only the destination port --- and serves to give
+     * @ref local_locator() something more useful than zero for the sender
+     * resource's bookkeeping.
      */
-    std::atomic<uint16_t> source_logical_port_{0};
+    std::atomic<uint16_t> local_logical_port_{0};
 };
 
 } // namespace rtps
