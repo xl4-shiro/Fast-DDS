@@ -723,7 +723,7 @@ exist yet, and the field itself would become another deviation to unwind.
 
 | Tag | Document |
 |---|---|
-| [DDS-TSN] | OMG, *DDS Extensions for Time Sensitive Networking*, v1.0 beta, ptc/2023-03-03 |
+| [DDS-TSN] | OMG, *DDS Extensions for Time Sensitive Networking*, v1.0 beta, ptc/2023-03-03 --- <https://www.omg.org/spec/DDS-TSN/1.0/Beta1/PDF> |
 | [DDSI-RTPS] | OMG, *Real-Time Publish-Subscribe Protocol DDS Interoperability Wire Protocol*, v2.5, formal/2022-04-01 |
 | [1722] | IEEE Std 1722-2025, *Standard for a Transport Protocol for Time-Sensitive Applications in Bridged Local Area Networks* |
 | [802.1Qcc] | IEEE Std 802.1Qcc-2018, and the `ieee802-dot1q-cnc-config` YANG module it defines |
