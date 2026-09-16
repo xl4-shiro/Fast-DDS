@@ -81,11 +81,18 @@ distribution.** Packages are built for `noble` and `jammy` (Ubuntu), and
 `trixie` and `bookworm` (Debian).
 
 On a derivative, use the codename of the distribution it is built on, not its
-own: Linux Mint 22.x takes `noble` and Mint 21.x takes `jammy`, and a
-Debian-derived distribution takes whichever Debian release it tracks. Note that
-`lsb_release -cs` prints the derivative's own codename, so it is not the answer
-here — check what your distribution is based on. On Ubuntu and Debian proper,
-`lsb_release -cs` is correct.
+own. `/etc/os-release` records both, so this prints the right one everywhere:
+
+```bash
+. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+```
+
+On an Ubuntu derivative, `UBUNTU_CODENAME` names the Ubuntu release it is built
+on; on Ubuntu and Debian proper it is absent or identical, and
+`VERSION_CODENAME` answers. Linux Mint 22.3, for instance, reports
+`VERSION_CODENAME=zena` and `UBUNTU_CODENAME=noble` --- `noble` is the one to
+use. Do not use `lsb_release -cs`: it prints the derivative's own codename
+(`zena`), which no repository is published for.
 
 One-line format, in `/etc/apt/sources.list.d/xl4.list`:
 
@@ -167,30 +174,67 @@ Look for this line to confirm the transport is in:
 
 ## Running
 
-Raw sockets need `CAP_NET_RAW`:
+Two capabilities are needed --- `CAP_NET_RAW` to open the socket and
+`CAP_NET_ADMIN` for promiscuous mode --- granted per run as *ambient*
+capabilities:
 
 ```bash
-sudo setcap cap_net_raw+ep ./tsn
+sudo capsh --user=${USER} \
+     --inh=cap_net_raw,cap_net_admin \
+     --addamb=cap_net_raw,cap_net_admin -- \
+     -c "<command>"
 ```
 
-Then, on the talker node:
+That runs `<command>` as you rather than as root, with those two capabilities and
+nothing else. It is worth wrapping in a shell function, since every command below
+needs it:
 
 ```bash
-./tsn publisher -i eth0 -t ControlCommand --cuc-id br01 --uniconf-db /var/lib/uniconf.db
+tsncap() {
+    sudo capsh --user=${USER} \
+         --inh=cap_net_raw,cap_net_admin \
+         --addamb=cap_net_raw,cap_net_admin -- -c "$*"
+}
+```
+
+`setcap cap_net_raw,cap_net_admin+ep ./tsn` looks like the simpler answer and
+usually is not: file capabilities are ignored on a `nosuid` mount, which is how an
+encrypted home directory is mounted, and they make the loader discard
+`LD_LIBRARY_PATH`, so a binary that finds its libraries that way stops loading.
+Ambient capabilities travel with the process and avoid both.
+
+`uniconf` must be running before the DDS application starts:
+
+```bash
+tsncap "uniconf -p testdb -c /usr/local/share/xl4uniconf/ucinit.bconf"
+```
+
+Use the path your install actually has --- a package puts it under `/usr/share`,
+a source build under `/usr/local/share`. `uniconf` needs the capabilities only if
+it configures the Ethernet port itself, for instance a credit-based shaper;
+otherwise run it plain.
+
+On the talker node:
+
+```bash
+tsncap "./tsn publisher -i eth0 -t HelloWorldTopic --cuc-id br01 --uniconf-db testdb --vlan 10"
 ```
 
 and on the listener node:
 
 ```bash
-./tsn subscriber -i eth0 -t ControlCommand --cuc-id br01 --uniconf-db /var/lib/uniconf.db
+tsncap "./tsn subscriber -i eth0 -t HelloWorldTopic --cuc-id br01 --uniconf-db testdb --vlan 10"
 ```
 
-`ControlCommand` is just a name --- nothing in the code requires it, and `-t`
-defaults to `HelloWorldTopic`. What matters is that the topic name matches the
-`station-name` the CUC provisioned for this interface, on both nodes, because
-that is how the stream is found. Rename it to anything you like, as long as `-t`
-and `station-name` change together; drop `-t` entirely and provision the
-station-name as `HelloWorldTopic`.
+`HelloWorldTopic` is just a name --- nothing in the code requires it, and `-t`
+defaults to it. What matters is that the topic name matches the `station-name`
+the CUC provisioned for this interface, on both nodes, because that is how the
+stream is found. Rename it to anything you like, as long as `-t` and
+`station-name` change together.
+
+`--vlan 10` sets the VLAN for traffic that has no provisioned stream behind it,
+which in practice means discovery --- SPDP and SEDP. Traffic on a CNC stream uses
+the VLAN the CNC assigned to that stream, not this one.
 
 Run `./tsn` with no arguments for the full option list.
 
@@ -216,9 +260,106 @@ specification, plus an `accept` flag. This example reads that back:
   provisioned stream — discovery, above all — falls back to the descriptor's
   `default_vlan_id` and `default_pcp`.
 
-- **The transport reports back.** Each end-station interface's `status` leaf is
-  set to `CONNECTED` when the participant starts and `DISCONNECTED` when it
-  stops, so the CUC can see which endpoints are live.
+- **The `status` leaf is not written by this transport.** It belongs to the CNC,
+  which sets it to `connected` once it has established the route between the
+  talker and the listener. That is a statement about the network, not about the
+  end station: a talker that is sending and a listener that is receiving say
+  nothing about whether the data arrives, and only the CNC knows whether the path
+  exists. A DDS application has no need to read it either --- it learns the same
+  thing from whether samples turn up --- but nothing here overwrites it.
+
+### Connection state
+
+`accept` is not a flag but a state the CUC asks the end-station interface to be
+in, a `uint8` whose values are the same as those of the `status` leaf the CNC
+writes back. The transport re-reads it every `cnc_revocation_poll_ms` (default
+1000; 0 disables the check) and follows it:
+
+| `accept` | Meaning    | What the transport does                        |
+|----------+------------+------------------------------------------------|
+|        0 | init       | disconnects                                    |
+|        1 | connect    | connects, or reconnects                        |
+|        2 | disconnect | disconnects                                    |
+|        3 | deleting   | disconnects; final, the stream will not return |
+
+Each transition is logged as a warning and passed to the application through
+`on_stream_state_changed`. Nothing is written back to the datastore: `accept` is
+the CUC's, `status` is the CNC's.
+
+Disconnecting tears down the talker and stops reception; connecting rebuilds the
+talker on the next send. `1 <-> 0` and `1 <-> 2` are both ordinary operation ---
+a CUC typically disconnects a stream to give its bandwidth to a higher-priority
+one, and connects it again later.
+
+```
+[TSN_TRANSPORT Warning] The CUC has disconnected the stream named 'HelloWorldTopic'
+  (accept 2). No data is sent or received on it until the CUC connects it again.
+[TSN_TRANSPORT Warning] The CUC has connected the stream named 'HelloWorldTopic'.
+  Reconnecting it.
+```
+
+The talker is destroyed rather than merely silenced, and that is the point. It
+holds the stream ID, PCP and shaper rate the CNC granted, and a CUC that connects
+the stream again need not grant the same terms --- it disconnected it to give
+that bandwidth elsewhere. Rebuilding reads whatever the CNC says at that moment.
+Changing the PCP from 3 to 5 while a stream is disconnected, then connecting it
+again, moves the traffic to the new priority:
+
+```
+35 frames  vlan.priority 3     before the disconnect
+48 frames  vlan.priority 5     after the reconnect
+```
+
+The listener keeps its socket, because Fast DDS owns the channel and holds a
+receiver pointer into it. Nothing on the wire depends on that: a listener that
+receives nothing consumes no reservation.
+
+**The application is told, through
+`TSNTransportDescriptor::on_stream_state_changed(station_name, state)`.** It
+reports *every* stream the CUC provisioned for this interface, not only the ones
+this process uses: the transport cannot know which topic an application bound to,
+since that mapping lives in the DDS layer. Match `station_name` against your own
+topics before acting --- otherwise another stream being deleted will stop a run
+that is working. The
+transport acts on the change by itself, but a DataWriter never learns of it:
+`write()` succeeds under BEST_EFFORT and the frame is then dropped. Without the
+callback an application would go on reporting samples it had "sent" while nothing
+reached the wire --- which reads as though the *listener* had stopped rather than
+the talker, since only the subscriber visibly goes quiet.
+
+This example uses it to stop publishing while the stream is down, so its output
+matches what is on the wire and the sequence has no hole in it:
+
+```
+Stream 'HelloWorldTopic' disconnected by the CUC; not sending until it is connected again.
+Stream 'HelloWorldTopic' connected by the CUC; carrying data again.
+Published 79 samples
+```
+
+**`accept` 3 is final**: the stream is being removed from the CUC data and no
+later 1 will bring it back. What that means is the application's to decide ---
+this example carries one topic on one stream, so it stops and exits, while an
+application serving several topics would drop that one and carry on.
+
+```
+Stream 'HelloWorldTopic' deleted by the CUC; nothing left to carry, finishing.
+Published 175 samples (stopped: the CUC deleted the stream)
+```
+
+Two things to be aware of:
+
+- **A write issued while disconnected is lost, silently.**
+  `DataWriter::write()` still succeeds: the QoS is BEST_EFFORT, so there is no
+  delivery guarantee to break, and the transport drops the frame rather than
+  putting it on a released reservation. An application that ignores
+  `on_stream_state_changed` and keeps writing will see its own counters rise
+  while the subscriber receives nothing.
+- **An `accept` value outside 0--3 is treated as `init`**, i.e. disconnected. An
+  end station that cannot tell what is being asked of it must not send.
+
+Traffic with no provisioned stream behind it --- discovery, and anything on the
+fallback path --- is unaffected: the CUC never granted it, so there is nothing to
+disconnect.
 
 ### Strict mode
 
@@ -234,17 +375,11 @@ worse than not sending. Two things then change:
   accept every stream for this node, for at most `cnc_wait_timeout_ms`
   (`--cnc-timeout`, default 10000). If that expires it logs an error and refuses
   to start, which makes `create_participant()` fail and return `nullptr`.
+  When `cnc_wait_timeout_ms` is 0, it wait for the accept forever.
 - An endpoint whose topic has no provisioned stream waits for that specific
   stream, on the same terms, and is refused at creation only once the wait
   expires --- rather than quietly sending on the participant's own locators.
 
-  The endpoint waits for *its own* stream, not merely for the node to have some
-  accepted stream. The two differ whenever a datastore already holds entries for
-  other topics: the transport's check above is satisfied by those, so without a
-  second, topic-specific wait an endpoint would give up instantly on a populated
-  datastore while waiting patiently on an empty one. Whether an endpoint waited
-  would depend on whether unrelated topics happened to be provisioned, which is
-  not a useful distinction.
 
 Discovery is deliberately *not* blocked. It is framed as a control format, not a
 stream, so there is nothing to schedule and nothing to refuse --- which is what
@@ -258,17 +393,24 @@ from discovery reaching an unknown peer. The DDS layer knows which topic an
 endpoint serves, and is the only layer that can.
 
 ```bash
-./tsn publisher -i eth0 -t ControlCommand --uniconf-db /var/lib/uniconf.db \
-      --no-fallback --cnc-timeout 30000
+SCRIPT_EXEC="./tsn publisher -i eth0 -t HelloWorldTopic --cuc-id br01 --uniconf-db testdb \
+      --vlan 10 --no-fallback --cnc-timeout 30000"
+sudo capsh --user=${USER} \
+     --inh=cap_net_raw,cap_net_admin \
+     --addamb=cap_net_raw,cap_net_admin -- \
+     -c "${SCRIPT_EXEC}"
 ```
 
 `cnc_wait_timeout_ms` governs both modes; only the consequence of expiry
 differs:
 
-| | timeout expires |
-|---|---|
-| `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP |
-| `allow_fallback = false` | error; the transport does not start and participant creation fails, or, for an endpoint whose topic was never provisioned, the endpoint is refused |
+|                                   | timeout expires                                    |
+|-----------------------------------+----------------------------------------------------|
+| `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP       |
+| `allow_fallback = false`          | error; the transport does not start and            |
+|                                   | participant creation fails, or,                    |
+|                                   | for an endpoint whose topic was never provisioned, |
+|                                   | the endpoint is refused                            |
 
 A timeout of **0 waits indefinitely**. In strict mode that means participant
 creation, and then endpoint creation, do not return until the CNC responds, and
@@ -301,22 +443,26 @@ schedule then has to account for several frames per sample.
 
 ## Testing without a TSN network
 
-The transport needs a real link, so a single machine cannot run both ends over
-one interface. A `veth` pair in two network namespaces gives you both ends on
-one host:
+The transport needs a real link, so one interface cannot carry both ends. A
+`veth` pair is enough --- it is a cable with two ends on one host:
 
 ```bash
-sudo ip netns add tsn-a
-sudo ip netns add tsn-b
 sudo ip link add veth-a type veth peer name veth-b
-sudo ip link set veth-a netns tsn-a
-sudo ip link set veth-b netns tsn-b
-sudo ip netns exec tsn-a ip link set veth-a up
-sudo ip netns exec tsn-b ip link set veth-b up
+sudo ip link set veth-a up
+sudo ip link set veth-b up
 
-sudo ip netns exec tsn-a ./tsn publisher  -i veth-a --no-gptp
-sudo ip netns exec tsn-b ./tsn subscriber -i veth-b --no-gptp
+./tsn subscriber -i veth-b --no-gptp &
+./tsn publisher  -i veth-a --no-gptp
 ```
+
+No network namespaces are needed. Each process binds an `AF_PACKET` socket to one
+named interface, so a frame sent on `veth-a` goes out and arrives on `veth-b`;
+nothing here uses the IP layer, which is what would otherwise short-circuit two
+endpoints on the same host. Namespaces work too, and are worth the trouble only
+if you also want separate IP stacks or routing tables --- for this they add
+nothing.
+
+Grant the capabilities as in [Running](#running); `sudo` works for a quick try.
 
 Use `--no-gptp` where no `gptp2d` is running. The transport calls
 `gptpmasterclock_init()` itself and falls back to the monotonic clock if the
@@ -328,6 +474,68 @@ non-default segment.
 Without a CNC, leave `--uniconf-db` unset. The transport logs that uniconf is
 unavailable and sends everything on the default VLAN and PCP, unscheduled, which
 is enough to see samples flow.
+
+## Static configuration instead of CUC and CNC
+
+With CUC and CNC daemons running, the stream information is provisioned
+dynamically. For testing, the same entries can be written straight into the
+datastore and edited by hand, which is simpler to set up and makes every
+transition reproducible.
+
+The talker side, saved as `t.conf`:
+
+```
+/ieee802-dot1q-cnc-config/cnc-config/domain|domain-id:domain00|/cuc|cuc-id:br01|/stream|stream-id:E6-98-85-B2-4B-DF:00-01|/talker/data-frame-specification|index:0|/ieee802-mac-addresses/destination-mac-address 91-E0-F0-00-FE-00
+../ieee802-vlan-tag/vlan-id 100
+priority-code-point 3
+/ieee802-dot1q-cnc-config/cnc-config/domain|domain-id:domain00|/cuc|cuc-id:br01|/stream|stream-id:E6-98-85-B2-4B-DF:00-01|/talker/end-station-interfaces|mac-address:E6-98-85-B2-4B-DF|interface-name:veth-a|/station-name HelloWorldTopic
+accept 1
+```
+
+The listener side, saved as `l.conf`:
+
+```
+/ieee802-dot1q-cnc-config/cnc-config/domain|domain-id:domain00|/cuc|cuc-id:br01|/stream|stream-id:E6-98-85-B2-4B-DF:00-01|/listener|index:0|/end-station-interfaces|mac-address:EA-BD-3D-AF-77-20|interface-name:veth-b|/station-name HelloWorldTopic
+accept 1
+```
+
+**Replace the MAC addresses with your own.** `E6-98-85-B2-4B-DF` is the talker
+interface and `EA-BD-3D-AF-77-20` the listener interface; note that the talker's
+address appears twice, once as `mac-address` and once inside `stream-id`, and
+both have to change. `ip -br link show veth-a` prints what to use.
+
+`uniconf` reads them at startup, `-c` taking each file in turn:
+
+```bash
+uniconf -p testdb -c /usr/local/share/xl4uniconf/ucinit.bconf -c t.conf -c l.conf
+```
+
+Either side can then be connected and disconnected while the applications run, by
+writing the `accept` leaf: 1 connects, 2 disconnects, 0 returns it to the initial
+state and 3 deletes the stream.
+
+The talker:
+
+```bash
+STREAM="/ieee802-dot1q-cnc-config/cnc-config/domain|domain-id:domain00|/cuc|cuc-id:br01|/stream|stream-id:E6-98-85-B2-4B-DF:00-01"
+TALKER="${STREAM}|/talker/end-station-interfaces|mac-address:E6-98-85-B2-4B-DF|interface-name:veth-a|/accept"
+
+uniconfmon -p testdb -n "${TALKER}" 2     # connect -> disconnect
+uniconfmon -p testdb -n "${TALKER}" 1     # disconnect -> connect
+```
+
+The listener:
+
+```bash
+LISTENER="${STREAM}|/listener|index:0|/end-station-interfaces|mac-address:EA-BD-3D-AF-77-20|interface-name:veth-b|/accept"
+
+uniconfmon -p testdb -n "${LISTENER}" 2   # connect -> disconnect
+uniconfmon -p testdb -n "${LISTENER}" 1   # disconnect -> connect
+```
+
+The two sides are independent: disconnecting the talker stops it sending, and
+disconnecting the listener stops it receiving. See
+[Connection state](#connection-state) for what each value does.
 
 ## Reading the traffic in Wireshark
 
@@ -378,9 +586,9 @@ traffic can be read at a glance:
 ```
 INFO_TS, DATA(p), Unknown[80]                   [SPDP, control port 7400]
 INFO_TS, DATA(p), Unknown[80]                   [SPDP, control port 7410]
-INFO_DST, INFO_TS, DATA(w) -> ControlCommand    [SEDP-pub, control port 7410]
+INFO_DST, INFO_TS, DATA(w) -> HelloWorldTopic    [SEDP-pub, control port 7410]
 INFO_DST, ACKNACK, Unknown[80]                  [SEDP-sub, control port 7410]
-INFO_DST, INFO_TS, DATA -> ControlCommand       [stream port 7401]
+INFO_DST, INFO_TS, DATA -> HelloWorldTopic       [stream port 7401]
 ```
 
 The label comes from the RTPS writer entity ID, not the logical port, because
