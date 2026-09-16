@@ -21,8 +21,10 @@
 
 #include <atomic>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include <fastdds/rtps/transport/TransportInterface.hpp>
@@ -268,6 +270,37 @@ private:
     std::atomic<bool> initialized_{false};
 
     std::unique_ptr<tsn::TsnCncConfig> cnc_config_;
+
+    /**
+     * Re-read the CNC configuration periodically and disconnect or reconnect
+     * streams whose @c accept has changed, until @ref monitor_running_ is
+     * cleared.
+     */
+    void revocation_monitor();
+
+    //! One pass: compare every open stream against the CNC's current accept.
+    void apply_cnc_acceptance();
+
+    //! Log the state change and report the reached state back to the CNC.
+    void report_connectivity(
+            const tsn::TsnStream& stream);
+
+    /**
+     * Last @c accept seen for each stream provisioned for this interface.
+     *
+     * Keyed on stream ID rather than on anything the transport has open, so that
+     * a stream the node is not currently using is still tracked: a talker is
+     * only opened once there is something to send to, and a deletion arriving
+     * before that must not go unnoticed. Guarded by @ref accept_mutex_.
+     */
+    mutable std::mutex accept_mutex_;
+    std::map<tsn::StreamId, tsn::CncAccept> last_accept_;
+
+    //! Streams already announced as deleted, so that is reported once each.
+    std::set<tsn::StreamId> deleted_streams_;
+
+    std::thread revocation_thread_;
+    std::atomic<bool> monitor_running_{false};
 
     mutable std::mutex input_mutex_;
     std::map<ListenerKey, std::unique_ptr<tsn::TSNChannelResource>> input_channels_;

@@ -177,7 +177,7 @@ bool TSNTransport::init(
         {
             // Strict mode keeps waiting even while the datastore is empty: the
             // CUC may not have written this node's entries yet.
-            const bool ready = cnc_config_->wait_for_accepted_streams(
+            const bool ready = cnc_config_->wait_for_any_accepted_stream(
                 configuration_.cnc_wait_timeout_ms, strict);
 
             if (!ready && strict)
@@ -188,7 +188,7 @@ bool TSNTransport::init(
                 // honest outcome.
                 EPROSIMA_LOG_ERROR(TSN_TRANSPORT,
                         "Gave up after " << configuration_.cnc_wait_timeout_ms
-                                         << " ms waiting for the CNC to provision and accept streams for cuc-id '"
+                                         << " ms waiting for the CNC to provision and accept a stream for cuc-id '"
                                          << configuration_.cuc_id << "' on " << configuration_.interface_name
                                          << ". allow_fallback is false, so the transport will not start. "
                                          << "Raise cnc_wait_timeout_ms, set it to 0 to wait indefinitely, "
@@ -196,7 +196,11 @@ bool TSNTransport::init(
                 return false;
             }
         }
-        cnc_config_->report_status_for_all(tsn::EndStationStatus::connected);
+        if (configuration_.cnc_revocation_poll_ms > 0)
+        {
+            monitor_running_.store(true);
+            revocation_thread_ = std::thread(&TSNTransport::revocation_monitor, this);
+        }
     }
     else if (!configuration_.allow_fallback)
     {
@@ -216,6 +220,189 @@ bool TSNTransport::init(
     return true;
 }
 
+void TSNTransport::revocation_monitor()
+{
+    // This polls. Nothing in uniconf pushes a change here: the thread re-reads
+    // the end-station entries on a timer and compares them with what it saw last
+    // time, so a change to accept is noticed somewhere between zero and one
+    // cnc_revocation_poll_ms after the CUC writes it, and a change that appears
+    // and reverts inside one interval is not noticed at all.
+    //
+    // uniconf can do better. uc_notice.h provides an event mechanism ---
+    // uc_notice_init() opens it against a database, uc_nc_notice_register()
+    // registers interest in particular keys, uc_notice_start_events_thread()
+    // delivers what arrives --- so the transport could be woken by the write
+    // rather than looking for it. Registering the accept leaf of each
+    // end-station interface the CUC provisioned for this node would cut the
+    // latency to roughly the time the datastore takes to publish the event, and
+    // would stop this thread re-reading a datastore that has usually not
+    // changed.
+    //
+    // Polling was kept because it reuses TsnCncConfig::refresh() exactly as the
+    // startup waits already do, and because a missed or duplicated event only
+    // costs another poll here, whereas a notification path that silently stops
+    // delivering would leave a stream running on a released reservation. If the
+    // CUC expects a faster reaction than a second, this is the place to change:
+    // apply_cnc_acceptance() below is independent of what triggers it, so only
+    // the waiting changes, not the acting.
+    const auto period = std::chrono::milliseconds(configuration_.cnc_revocation_poll_ms);
+    const auto slice = std::chrono::milliseconds(100);
+
+    while (monitor_running_.load())
+    {
+        // Sleep in slices rather than one long wait, so shutdown() does not have
+        // to block for a whole poll interval before this thread joins.
+        auto slept = std::chrono::milliseconds::zero();
+        while (monitor_running_.load() && slept < period)
+        {
+            const auto step = (period - slept) < slice ? (period - slept) : slice;
+            std::this_thread::sleep_for(step);
+            slept += step;
+        }
+
+        if (!monitor_running_.load() || !cnc_config_)
+        {
+            continue;
+        }
+        if (cnc_config_->refresh())
+        {
+            apply_cnc_acceptance();
+        }
+    }
+}
+
+void TSNTransport::apply_cnc_acceptance()
+{
+    // Every stream the CUC provisioned for this interface, not just the ones
+    // with a socket open. A talker is created only when there is a destination
+    // to send to, so a node that has not matched a reader yet holds none --- and
+    // an accept change arriving in that window still has to be acted on.
+    std::vector<tsn::TsnStream> provisioned = cnc_config_->talkers();
+    const std::vector<tsn::TsnStream> listeners = cnc_config_->listeners();
+    provisioned.insert(provisioned.end(), listeners.begin(), listeners.end());
+
+    std::vector<tsn::TsnStream> changed;
+    {
+        std::lock_guard<std::mutex> guard(accept_mutex_);
+        const bool first_pass = last_accept_.empty();
+        for (const tsn::TsnStream& stream : provisioned)
+        {
+            auto seen = last_accept_.find(stream.stream_id);
+            const bool is_new = (seen == last_accept_.end());
+            if (!is_new && seen->second == stream.accept)
+            {
+                continue;
+            }
+            last_accept_[stream.stream_id] = stream.accept;
+
+            // The first pass only records where things stand; the state a
+            // participant started in was already reported during init().
+            if (!first_pass && !is_new)
+            {
+                changed.push_back(stream);
+            }
+        }
+    }
+
+    for (const tsn::TsnStream& stream : changed)
+    {
+        if (!stream.connected())
+        {
+            {
+                std::lock_guard<std::mutex> guard(output_mutex_);
+                for (auto it = talkers_.begin(); it != talkers_.end(); )
+                {
+                    // Erase rather than flag it. The talker holds the stream ID,
+                    // PCP and shaper rate the CNC granted, and a CUC that
+                    // connects the stream again need not grant the same terms ---
+                    // it disconnected it to give that bandwidth elsewhere.
+                    // Rebuilding on the next send picks up whatever it says then.
+                    it = (it->first.destination_mac == stream.destination_mac &&
+                            it->first.vlan_id == stream.vlan_id)
+                            ? talkers_.erase(it) : std::next(it);
+                }
+            }
+        }
+
+        // The listener side cannot be erased the same way: Fast DDS owns the
+        // channel and holds a receiver pointer into it. Its reception is stopped
+        // instead, and its socket kept --- which changes nothing on the wire,
+        // since a listener that receives nothing consumes no reservation.
+        {
+            std::lock_guard<std::mutex> guard(input_mutex_);
+            for (auto& entry : input_channels_)
+            {
+                if (entry.first.destination_mac == stream.destination_mac &&
+                        entry.first.vlan_id == stream.vlan_id)
+                {
+                    entry.second->set_disconnected(!stream.connected());
+                }
+            }
+        }
+
+        report_connectivity(stream);
+
+        if (configuration_.on_stream_state_changed)
+        {
+            // A deletion is announced once; the other states can legitimately
+            // repeat as the CUC moves a stream around.
+            bool announce = true;
+            if (tsn::CncAccept::deleting == stream.accept)
+            {
+                std::lock_guard<std::mutex> guard(accept_mutex_);
+                announce = deleted_streams_.insert(stream.stream_id).second;
+            }
+            if (announce)
+            {
+                configuration_.on_stream_state_changed(stream.station_name,
+                        static_cast<TsnStreamState>(stream.accept));
+            }
+        }
+    }
+}
+
+void TSNTransport::report_connectivity(
+        const tsn::TsnStream& stream)
+{
+    // Logged, not written back. The status leaf belongs to the CNC: it says
+    // whether the CNC has established the route between talker and listener,
+    // which is a question about the network, not about this end station. That a
+    // talker is sending says nothing about whether the data arrives, and an end
+    // station writing its own idea of "connected" into that leaf would overwrite
+    // the only place the answer lives.
+    switch (stream.accept)
+    {
+        case tsn::CncAccept::connect:
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "The CUC has connected the stream named '" << stream.station_name
+                                                               << "'. Reconnecting it.");
+            break;
+
+        case tsn::CncAccept::disconnect:
+            // A warning, not an error: a CUC disconnecting a stream to free
+            // bandwidth for a higher-priority one is the system working as
+            // designed, and the transport is following it.
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "The CUC has disconnected the stream named '" << stream.station_name
+                                                                  << "' (accept 2). No data is sent or received on it "
+                                                                  << "until the CUC connects it again.");
+            break;
+
+        case tsn::CncAccept::deleting:
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "The CUC is deleting the stream named '" << stream.station_name
+                                                             << "' (accept 3). Disconnecting it; it will not return.");
+            break;
+
+        case tsn::CncAccept::init:
+        default:
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
+                    "The CUC has returned the stream named '" << stream.station_name
+                                                              << "' to its initial state (accept 0). Disconnecting it.");
+            break;
+    }
+}
+
 void TSNTransport::shutdown()
 {
     if (!initialized_.exchange(false))
@@ -223,9 +410,10 @@ void TSNTransport::shutdown()
         return;
     }
 
-    if (cnc_config_)
+    monitor_running_.store(false);
+    if (revocation_thread_.joinable())
     {
-        cnc_config_->report_status_for_all(tsn::EndStationStatus::disconnected);
+        revocation_thread_.join();
     }
 
     {
@@ -359,6 +547,7 @@ tsn::AvtpStreamConfig TSNTransport::stream_config_for(
         {
             config.stream_id = stream.stream_id;
             config.stream_id_from_cnc = true;
+            config.cnc_accepted = stream.connected();
             // One talker, its own destination address: streaming data, as
             // IEEE 1722 requires of a stream subtype.
             config.subtype = configuration_.stream_subtype;
@@ -436,6 +625,18 @@ AvtpStream* TSNTransport::get_or_open_talker(
     if (it != talkers_.end())
     {
         return it->second.get();
+    }
+
+    if (config.stream_id_from_cnc && !config.cnc_accepted)
+    {
+        // The CNC has withdrawn this stream. Opening a talker now would put
+        // traffic back on a reservation the network has released --- which is
+        // the point of the withdrawal, since the bandwidth has gone to some
+        // higher-priority stream. It stays shut until the CNC grants it again.
+        EPROSIMA_LOG_INFO(TSN_TRANSPORT, "Not opening a talker to "
+                << EthernetLocator::mac_to_string(locator)
+                << ": the CNC has withdrawn its stream");
+        return nullptr;
     }
 
     if (!config.stream_id_from_cnc && !configuration_.allow_fallback &&

@@ -20,6 +20,7 @@
 #define FASTDDS_RTPS_TRANSPORT__TSNTRANSPORTDESCRIPTOR_HPP
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include <fastdds/fastdds_dll.hpp>
@@ -78,6 +79,25 @@ class TransportInterface;
  *
  * @ingroup TRANSPORT_MODULE
  */
+/**
+ * State the CUC asks a TSN Stream's end-station interface to be in.
+ *
+ * Mirrors the @c accept leaf of @c xl4-ieee802-dot1q-cnc-config, whose values are
+ * the same as those of the @c status leaf, which the CNC writes to say whether
+ * it has established the route the stream needs.
+ */
+enum class TsnStreamState : uint8_t
+{
+    //! Not configured yet; nothing runs on the stream.
+    init = 0,
+    //! Carrying data, or about to.
+    connected = 1,
+    //! Stopped, but still provisioned and able to come back.
+    disconnected = 2,
+    //! Being removed from the CUC data; it will not come back.
+    deleted = 3
+};
+
 struct TSNTransportDescriptor : public PortBasedTransportDescriptor
 {
     /**
@@ -285,6 +305,60 @@ struct TSNTransportDescriptor : public PortBasedTransportDescriptor
      * input channel takes.
      */
     uint32_t reception_timeout_ms = 100;
+
+    /**
+     * How often to re-read the CNC configuration while running, milliseconds.
+     *
+     * The @c accept leaf is the state the CUC asks an end-station interface to
+     * be in --- 0 init, 1 connect, 2 disconnect, 3 deleting --- and it changes
+     * while the node runs: a CUC commonly disconnects a stream to give its
+     * bandwidth to a higher-priority one and connects it again later. Nothing
+     * else re-reads the datastore once the participant is up, so without this a
+     * disconnected stream would keep being used: traffic on a reservation the
+     * network has released.
+     *
+     * Disconnecting tears the talker down and stops reception; connecting
+     * rebuilds the talker from the CNC's parameters as they are then, which need
+     * not be the parameters it had before. Each transition is logged as a
+     * warning and passed to @ref on_stream_state_changed. Nothing is written back
+     * to the datastore: @c accept belongs to the CUC and @c status to the CNC.
+     *
+     * This is a poll, so a change is noticed within one interval of the CUC
+     * writing it. Lowering the interval costs a datastore read each time;
+     * uniconf's @c uc_notice.h event mechanism would remove the trade-off
+     * altogether, and @c TSNTransport::revocation_monitor() explains what that
+     * would involve.
+     *
+     * 0 disables the check, which is right only where @c accept is known never
+     * to change after startup.
+     */
+    uint32_t cnc_revocation_poll_ms = 1000;
+
+    /**
+     * Called when the CUC changes the state it asks a stream to be in.
+     *
+     * The transport acts on the change itself --- disconnecting tears the talker
+     * down and stops reception, connecting rebuilds it --- but only the
+     * application knows what that means for it. A DataWriter is not told:
+     * @c write() still succeeds under BEST_EFFORT and the frame is then dropped,
+     * so without this an application would go on publishing into a stream that
+     * carries nothing, its own logs saying all is well.
+     *
+     * @ref TsnStreamState::deleted is final: the stream is being removed from the
+     * CUC data and no later connect will bring it back.
+     *
+     * **Every stream the CUC provisioned for this interface is reported, not
+     * only the ones this process uses.** The transport has no way to know which
+     * topic an application bound to --- that mapping lives in the DDS layer ---
+     * so the callback has to be told about all of them and the application must
+     * match @c station_name against the topics it cares about. Acting on another
+     * stream's deletion would stop a run that is working perfectly.
+     *
+     * Called from the transport's CNC polling thread, once per transition, with
+     * the @c station-name. Keep it short and do not create or destroy DDS
+     * entities from inside it.
+     */
+    std::function<void (const std::string& station_name, TsnStreamState state)> on_stream_state_changed;
 };
 
 } // namespace rtps

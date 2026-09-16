@@ -35,14 +35,26 @@ namespace fastdds {
 namespace rtps {
 namespace tsn {
 
-//! State reported back to the CNC for one end-station interface.
-enum class EndStationStatus : uint8_t
+/**
+ * State the CUC asks an end-station interface to be in.
+ *
+ * The @c accept leaf of @c xl4-ieee802-dot1q-cnc-config is a @c uint8 whose
+ * values line up with those of the @c status leaf, which is the CNC's to write:
+ * the CUC asks for a state through @c accept, and the CNC reports through
+ * @c status whether it has established the route to carry it. Anything outside
+ * this range is treated as @c init, since an end station that cannot tell what is
+ * being asked of it must not send.
+ */
+enum class CncAccept : uint8_t
 {
-    initial = 0,
-    connected = 1,
-    disconnected = 2,
-    deleted = 3,
-    operation_failed = 4
+    //! Not configured yet. Nothing may run on the stream.
+    init = 0,
+    //! Connect, or stay connected.
+    connect = 1,
+    //! Disconnect, but keep the stream provisioned for a later connect.
+    disconnect = 2,
+    //! The stream is being removed from the CUC data; it will not come back.
+    deleting = 3
 };
 
 /**
@@ -84,8 +96,14 @@ struct TsnStream
     uint8_t transmission_selection = 0;
     //! Stream rank. 1 for a DDS-TSN talker, per subclause 7.3.3 of [DDS-TSN].
     uint8_t rank = 0;
-    //! Whether the CNC has accepted this end-station interface.
-    bool accepted = false;
+    //! State the CUC is asking this end-station interface to be in.
+    CncAccept accept = CncAccept::init;
+
+    //! Whether the CUC currently wants this stream carrying data.
+    bool connected() const
+    {
+        return CncAccept::connect == accept;
+    }
     //! Whether this entry came from the talker list or the listener list.
     bool talker = false;
     //! Index of the listener within the stream. Always 0 for a talker.
@@ -153,11 +171,18 @@ public:
      *                         not have written it. When false, return as soon as
      *                         it is clear there is nothing to wait for, so an
      *                         unconfigured node does not stall startup.
-     * @return true when all streams are accepted, false on timeout or when
-     * there is nothing to wait for. The caller decides what a false means:
-     * fall back to the defaults, or refuse to start.
+     * @return true once at least one stream for this node is accepted; false on
+     * timeout or when there is nothing to wait for. The caller decides what a
+     * false means: fall back to the defaults, or refuse to start.
+     *
+     * One accepted stream is the bar, not all of them. This runs before any
+     * endpoint exists, so it cannot know which topics the node will use, and a
+     * datastore may hold streams serving other applications on the same
+     * interface --- one of them rejected must not block a participant that never
+     * touches it. Use @ref wait_for_stream_named() to wait for the particular
+     * stream an endpoint needs.
      */
-    bool wait_for_accepted_streams(
+    bool wait_for_any_accepted_stream(
             uint32_t timeout_ms,
             bool require_streams = false);
 
@@ -197,14 +222,15 @@ public:
     /**
      * Wait until one named stream is provisioned, accepted and usable.
      *
-     * @ref wait_for_accepted_streams waits for the node as a whole: it returns as
-     * soon as every stream the datastore holds for this interface is accepted,
-     * without regard to which topics those streams serve. That is the right
-     * question at transport level, but not at endpoint level --- a node whose
-     * datastore already carries streams for other topics passes it immediately,
-     * and an endpoint whose own stream has not been written yet would then give
-     * up at once while a node with an empty datastore waits patiently. This waits
-     * for the one stream that matters to the caller, so both cases behave alike.
+     * @ref wait_for_any_accepted_stream asks only whether the CNC has answered
+     * for this node at all, without regard to which topics its streams serve.
+     * That is the right question at transport level, where no endpoint exists
+     * yet, but it says nothing about the stream a particular endpoint needs: a
+     * node whose datastore carries an accepted stream for some other topic
+     * passes it immediately, and an endpoint whose own stream has not been
+     * written yet would then give up at once while a node with an empty
+     * datastore waits patiently. This waits for the one stream that matters to
+     * the caller, so both cases behave alike.
      *
      * Success means the stream exists, the CNC has accepted it, and it carries a
      * data-frame-specification --- the same three conditions the caller would
@@ -222,14 +248,6 @@ public:
             uint32_t timeout_ms,
             TsnStream& out);
 
-    //! Report the state of one end-station interface back to the CNC.
-    bool report_status(
-            const TsnStream& stream,
-            EndStationStatus status);
-
-    //! Report @c status for every stream belonging to this node.
-    void report_status_for_all(
-            EndStationStatus status);
 
 private:
 

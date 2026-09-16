@@ -70,6 +70,15 @@ struct AvtpStreamConfig
     StreamId stream_id{};
     //! Whether @ref stream_id came from the CNC rather than being derived locally.
     bool stream_id_from_cnc = false;
+
+    /**
+     * Whether the CNC currently accepts the stream this config belongs to.
+     *
+     * False means the CUC provisioned the stream but the CNC has withdrawn it,
+     * typically to give the bandwidth to a higher-priority stream. Nothing may
+     * be opened on it until it is granted again.
+     */
+    bool cnc_accepted = true;
     //! VLAN ID of the 802.1Q tag.
     uint16_t vlan_id = 0;
     //! Priority Code Point of the 802.1Q tag.
@@ -190,6 +199,31 @@ public:
     //! Stop a blocked receive() and make every later call fail.
     void disable();
 
+    /**
+     * Mark the stream disconnected, or connected again.
+     *
+     * A CNC may withdraw a Stream it has already granted, by setting the
+     * end-station interface's @c accept back to 0 --- typically because the
+     * bandwidth is needed for a higher-priority stream. The reservation along
+     * the path goes with it, so this is a disconnection, not a pause: while
+     * disconnected, send() refuses and receive() reports nothing.
+     *
+     * A talker is torn down outright on disconnection and rebuilt from the
+     * CNC's current parameters when the stream is granted again, so this exists
+     * for the listener side, whose channel Fast DDS owns and cannot be
+     * destroyed from under it.
+     *
+     * Distinct from @ref disable(), which is final.
+     */
+    void set_disconnected(
+            bool disconnected);
+
+    //! Whether the CNC has currently withdrawn this stream.
+    bool disconnected() const
+    {
+        return disconnected_.load();
+    }
+
 private:
 
     AvtpStream() = default;
@@ -206,6 +240,9 @@ private:
     bool uses_acf_ = false;
     bool talker_ = false;
     std::atomic<bool> enabled_{true};
+    std::atomic<bool> disconnected_{false};
+    //! Paces receive() while disconnected, matching what the socket would have done.
+    uint32_t reception_timeout_us_ = 100000;
 
     /**
      * Serializes send().

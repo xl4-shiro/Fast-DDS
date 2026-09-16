@@ -89,6 +89,25 @@ public:
 
     void disable() override;
 
+    /**
+     * Stop or resume reception, when the CNC withdraws or restores the Stream
+     * this channel listens to. See @ref AvtpStream::set_disconnected().
+     */
+    void set_disconnected(
+            bool disconnected)
+    {
+        if (stream_)
+        {
+            stream_->set_disconnected(disconnected);
+        }
+    }
+
+    //! Whether the CNC has currently withdrawn the stream this channel listens to.
+    bool disconnected() const
+    {
+        return stream_ && stream_->disconnected();
+    }
+
 private:
 
     TSNChannelResource(

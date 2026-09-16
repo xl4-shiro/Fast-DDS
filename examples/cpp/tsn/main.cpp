@@ -47,12 +47,17 @@
 
 using namespace eprosima::fastdds::dds;
 using eprosima::fastdds::rtps::EthernetLocator;
+using eprosima::fastdds::rtps::TsnStreamState;
 using eprosima::fastdds::rtps::TSNTransportDescriptor;
 
 namespace {
 
 std::atomic<bool> g_running{true};
 std::atomic<bool> g_started{false};
+//! Set when the CUC deletes the stream this run depends on (accept 3).
+std::atomic<bool> g_stream_deleted{false};
+//! Whether the CUC currently wants this node's stream carrying data.
+std::atomic<bool> g_stream_connected{true};
 
 void signal_handler(
         int signal_number)
@@ -229,6 +234,61 @@ TSNTransportDescriptor make_descriptor(
     descriptor.allow_fallback = options.allow_fallback;
     descriptor.cnc_wait_timeout_ms = options.cnc_timeout_ms;
     descriptor.use_gptp = !options.no_gptp;
+
+    // The transport stops the traffic by itself, but a DataWriter is never told:
+    // write() succeeds under BEST_EFFORT and the frame is then dropped. Without
+    // this the example would go on reporting samples it had "sent" while nothing
+    // reached the wire, which reads as though the listener had stopped rather
+    // than the talker.
+    // Copied so the lambda can capture it by value; the example builds as C++11,
+    // where an init-capture is not available.
+    const std::string topic = options.topic_name;
+    descriptor.on_stream_state_changed =
+            [topic](const std::string& station_name, TsnStreamState state)
+            {
+                // The callback reports every stream the CUC provisioned for this
+                // interface, not only the one this process uses --- the transport
+                // has no way to know which topic an application bound to. Ignore
+                // the rest: another stream being deleted is not this program's
+                // business, and acting on it would stop a run that is working.
+                if (station_name != topic)
+                {
+                    return;
+                }
+
+                // The transport logged this through Fast DDS, whose writer runs
+                // on its own thread; flush before printing or the two interleave
+                // mid-sentence.
+                Log::Flush();
+                switch (state)
+                {
+                    case TsnStreamState::connected:
+                        g_stream_connected.store(true);
+                        std::cout << "Stream '" << station_name
+                                  << "' connected by the CUC; carrying data again." << std::endl;
+                        break;
+
+                    case TsnStreamState::deleted:
+                        // Final: no later connect will bring it back. This
+                        // example carries one topic on one stream, so there is
+                        // nothing left for it to do. An application serving
+                        // several topics would drop this one and carry on.
+                        g_stream_connected.store(false);
+                        g_stream_deleted.store(true);
+                        g_running.store(false);
+                        std::cout << "Stream '" << station_name
+                                  << "' deleted by the CUC; nothing left to carry, finishing." << std::endl;
+                        break;
+
+                    default:
+                        g_stream_connected.store(false);
+                        std::cout << "Stream '" << station_name << "' "
+                                  << (TsnStreamState::init == state ? "reset to init" : "disconnected")
+                                  << " by the CUC; not sending until it is connected again." << std::endl;
+                        break;
+                }
+            };
+
     return descriptor;
 }
 
@@ -251,7 +311,7 @@ DomainParticipant* create_participant(
     {
         // Fast DDS logs at Error by default, so the transport's "waiting for the
         // CNC" warning would not show and this would look like a hang.
-        std::cout << "Strict mode: waiting for the CNC to provision and accept streams for cuc-id '"
+        std::cout << "Strict mode: waiting for the CNC to provision and accept a stream for cuc-id '"
                   << options.cuc_id << "' on " << options.interface_name << " (";
         if (0 == options.cnc_timeout_ms)
         {
@@ -512,9 +572,13 @@ int run_publisher(
         // Do not guess at the cause: creation fails for several reasons and the
         // transport has already logged the specific one.
         std::cerr << "Cannot create the participant; see the errors above. Common causes: "
-                  << "raw sockets need CAP_NET_RAW ('sudo setcap cap_net_raw+ep <binary>' or run "
-                  << "as root), and with --no-fallback the CNC must provision this node's streams "
-                  << "before the timeout." << std::endl;
+                  << "raw sockets need CAP_NET_RAW, and promiscuous mode needs CAP_NET_ADMIN. "
+                  << "Grant both per run with 'sudo capsh --user=$USER "
+                  << "--inh=cap_net_raw,cap_net_admin --addamb=cap_net_raw,cap_net_admin -- "
+                  << "-c \"...\"', or run as root. setcap is not a reliable substitute: it is "
+                  << "ignored on a nosuid mount such as an encrypted home directory, and it "
+                  << "makes the loader ignore LD_LIBRARY_PATH. Separately, with --no-fallback "
+                  << "the CNC must provision this node's streams before the timeout." << std::endl;
         return 1;
     }
 
@@ -549,7 +613,10 @@ int run_publisher(
 
     while (g_running.load() && (0 == options.samples || sent < options.samples))
     {
-        if (listener.matched() > 0)
+        // Only publish while the CUC has the stream connected. Writing anyway
+        // would succeed and be dropped by the transport, so the count would
+        // claim samples that never left the interface.
+        if (listener.matched() > 0 && g_stream_connected.load())
         {
             sample.index(++sent);
             writer->write(&sample);
@@ -558,7 +625,8 @@ int run_publisher(
         std::this_thread::sleep_for(std::chrono::milliseconds(options.period_ms));
     }
 
-    std::cout << "Published " << sent << " samples" << std::endl;
+    std::cout << "Published " << sent << " samples"
+              << (g_stream_deleted.load() ? " (stopped: the CUC deleted the stream)" : "") << std::endl;
     participant->delete_contained_entities();
     DomainParticipantFactory::get_instance()->delete_participant(participant);
     return 0;
@@ -574,9 +642,13 @@ int run_subscriber(
         // Do not guess at the cause: creation fails for several reasons and the
         // transport has already logged the specific one.
         std::cerr << "Cannot create the participant; see the errors above. Common causes: "
-                  << "raw sockets need CAP_NET_RAW ('sudo setcap cap_net_raw+ep <binary>' or run "
-                  << "as root), and with --no-fallback the CNC must provision this node's streams "
-                  << "before the timeout." << std::endl;
+                  << "raw sockets need CAP_NET_RAW, and promiscuous mode needs CAP_NET_ADMIN. "
+                  << "Grant both per run with 'sudo capsh --user=$USER "
+                  << "--inh=cap_net_raw,cap_net_admin --addamb=cap_net_raw,cap_net_admin -- "
+                  << "-c \"...\"', or run as root. setcap is not a reliable substitute: it is "
+                  << "ignored on a nosuid mount such as an encrypted home directory, and it "
+                  << "makes the loader ignore LD_LIBRARY_PATH. Separately, with --no-fallback "
+                  << "the CNC must provision this node's streams before the timeout." << std::endl;
         return 1;
     }
 
@@ -621,7 +693,8 @@ int run_subscriber(
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::cout << "Received " << listener.received() << " samples" << std::endl;
+    std::cout << "Received " << listener.received() << " samples"
+              << (g_stream_deleted.load() ? " (stopped: the CUC deleted the stream)" : "") << std::endl;
     participant->delete_contained_entities();
     DomainParticipantFactory::get_instance()->delete_participant(participant);
     return 0;

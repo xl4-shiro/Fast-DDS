@@ -18,7 +18,9 @@
 
 #include <rtps/transport/tsn/AvtpStream.hpp>
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 #include <fastdds/dds/log/Log.hpp>
 
@@ -145,6 +147,7 @@ std::unique_ptr<AvtpStream> AvtpStream::open(
     else
     {
         conpara->rec_tmout_us = static_cast<int>(config.reception_timeout_us);
+        stream->reception_timeout_us_ = config.reception_timeout_us;
     }
 
     avtpcon_set_version(stream->connection_, config.header_version);
@@ -246,12 +249,18 @@ void AvtpStream::disable()
     enabled_.store(false);
 }
 
+void AvtpStream::set_disconnected(
+        bool disconnected)
+{
+    disconnected_.store(disconnected);
+}
+
 bool AvtpStream::send(
         const std::vector<NetworkBuffer>& buffers,
         uint32_t total_bytes,
         uint16_t destination_logical_port)
 {
-    if (!enabled_.load() || nullptr == connection_)
+    if (!enabled_.load() || nullptr == connection_ || disconnected_.load())
     {
         return false;
     }
@@ -332,6 +341,14 @@ bool AvtpStream::receive(
 {
     if (!enabled_.load() || nullptr == connection_)
     {
+        return false;
+    }
+
+    if (disconnected_.load())
+    {
+        // Sleep for what the socket read would have blocked for. Returning
+        // straight away would turn the caller's receive loop into a spin.
+        std::this_thread::sleep_for(std::chrono::microseconds(reception_timeout_us_));
         return false;
     }
 

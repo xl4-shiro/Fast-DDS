@@ -44,7 +44,7 @@ static bool to_binding(
     out.interface_name = stream.interface_name;
     out.topic_name = stream.station_name;
     out.stream_id = rtps::tsn::stream_id_to_string(stream.stream_id);
-    out.accepted = stream.accepted;
+    out.accepted = stream.connected();
     out.max_frame_size = stream.max_frame_size;
     out.max_frames_per_interval = stream.max_frames_per_interval;
     if (!stream.has_data_frame_specification)

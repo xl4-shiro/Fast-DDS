@@ -73,6 +73,7 @@ public:
     explicit DbTransactionGuard(
             yang_db_item_access_t* ydbia)
         : ydbia_(ydbia)
+        , acquired_(std::chrono::steady_clock::now())
     {
     }
 
@@ -82,7 +83,25 @@ public:
         {
             uc_dbal_releasedb(ydbia_->dbald);
         }
+
+        // Measured after the release, so complaining about a long hold does not
+        // itself lengthen one. The transaction holds the datastore's semaphore,
+        // and every other process touching the same database blocks on it, so
+        // this is a budget rather than a performance note: a read that grows
+        // past it --- a datastore with far more streams than expected, say ---
+        // starts costing other processes their startup time.
+        const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - acquired_);
+        if (held.count() > max_hold_ms)
+        {
+            EPROSIMA_LOG_WARNING(TSN_TRANSPORT, "Held the uniconf transaction for "
+                    << held.count() << " ms, over the " << max_hold_ms
+                    << " ms budget; other processes on this datastore block for that long");
+        }
     }
+
+    //! How long one read burst may hold the datastore's semaphore, milliseconds.
+    static constexpr int64_t max_hold_ms = 200;
 
     DbTransactionGuard(
             const DbTransactionGuard&) = delete;
@@ -92,6 +111,7 @@ public:
 private:
 
     yang_db_item_access_t* ydbia_ = nullptr;
+    std::chrono::steady_clock::time_point acquired_;
 };
 
 uint32_t TsnStream::shaper_rate_kbps() const
@@ -177,7 +197,6 @@ TsnCncConfig::~TsnCncConfig()
 {
     if (nullptr != owned_db_)
     {
-        report_status_for_all(EndStationStatus::disconnected);
         uc_dbal_close(owned_db_, 0);
         ydbi_access_close();
         owned_db_ = nullptr;
@@ -221,7 +240,12 @@ bool TsnCncConfig::read_end_stations(
         TsnStream stream;
         stream.talker = talker;
         stream.interface_name = entry.interface_name;
-        stream.accepted = (0 != entry.accept);
+        // The CUC writes a state, not a flag: 0 init, 1 connect, 2 disconnect,
+        // 3 deleting. Reading it as a boolean would make "disconnect" and
+        // "deleting" both mean accepted, which is the opposite of what they say.
+        stream.accept = (entry.accept <= static_cast<uint8_t>(CncAccept::deleting))
+                ? static_cast<CncAccept>(entry.accept)
+                : CncAccept::init;
         stream.listener_index = entry.lindex;
         if (nullptr != entry.streamid)
         {
@@ -348,7 +372,7 @@ bool TsnCncConfig::refresh()
 }
 
 #define WAIT_STREAMS_LOOP_SLEEPMS 100 // 100 msec to sleep in one loop
-bool TsnCncConfig::wait_for_accepted_streams(
+bool TsnCncConfig::wait_for_any_accepted_stream(
         uint32_t timeout_ms,
         bool require_streams)
 {
@@ -360,7 +384,7 @@ bool TsnCncConfig::wait_for_accepted_streams(
     while (true)
     {
         bool any = false;
-        bool all_accepted = true;
+        bool any_accepted = false;
         {
             std::lock_guard<std::mutex> guard(mutex_);
             for (const auto* list : {&talkers_, &listeners_})
@@ -368,12 +392,24 @@ bool TsnCncConfig::wait_for_accepted_streams(
                 for (const TsnStream& stream : *list)
                 {
                     any = true;
-                    all_accepted = all_accepted && stream.accepted;
+                    any_accepted = any_accepted || stream.connected();
                 }
             }
         }
 
-        if (any && all_accepted)
+        // One accepted stream is enough. This runs during participant creation,
+        // before any endpoint exists, so it cannot know which topics this node
+        // will actually use --- and requiring every stream to be accepted makes
+        // one rejected stream block a participant that never touches it. A
+        // datastore holds the streams the CUC provisioned for this interface,
+        // which may serve several applications; a CNC rejecting one of them says
+        // nothing about the rest. All this needs to establish is that the CNC has
+        // answered for this node at all.
+        //
+        // The topic a given endpoint needs is gated precisely, and separately, by
+        // TsnStreamLocators::find_stream_for_topic(), which waits for that one
+        // stream to be accepted and to carry a data-frame-specification.
+        if (any_accepted)
         {
             return true;
         }
@@ -395,7 +431,7 @@ bool TsnCncConfig::wait_for_accepted_streams(
         if (!wait_forever && std::chrono::steady_clock::now() >= deadline)
         {
             EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
-                    "Timed out waiting for the CNC to accept every configured stream");
+                    "Timed out waiting for the CNC to accept a stream for this node");
             return false;
         }
 
@@ -407,7 +443,7 @@ bool TsnCncConfig::wait_for_accepted_streams(
             // Say so once: with no timeout this never returns on its own, and a
             // silent block during participant creation looks like a hang.
             EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
-                    "Waiting for the CNC to provision and accept streams for cuc-id '"
+                    "Waiting for the CNC to provision and accept a stream for cuc-id '"
                     << cuc_id_ << "' on " << interface_name_
                     << (wait_forever ? "; no timeout is set, so this waits indefinitely" : ""));
         }
@@ -474,7 +510,7 @@ bool TsnCncConfig::wait_for_stream_named(
     {
         TsnStream found;
         if (find_by_station_name(station_name, talker, found) &&
-                found.accepted && found.has_data_frame_specification)
+                found.connected() && found.has_data_frame_specification)
         {
             out = found;
             return true;
@@ -496,7 +532,21 @@ bool TsnCncConfig::wait_for_stream_named(
             const char* why = "has not been provisioned";
             if (found.station_name == station_name)
             {
-                why = found.accepted ? "has no data-frame-specification yet" : "has not been accepted yet";
+                switch (found.accept)
+                {
+                    case CncAccept::connect:
+                        why = "has no data-frame-specification yet";
+                        break;
+                    case CncAccept::disconnect:
+                        why = "has been disconnected by the CUC";
+                        break;
+                    case CncAccept::deleting:
+                        why = "is being deleted by the CUC";
+                        break;
+                    default:
+                        why = "has not been accepted yet";
+                        break;
+                }
             }
             EPROSIMA_LOG_WARNING(TSN_TRANSPORT,
                     "Waiting for the CNC: the " << (talker ? "talker" : "listener") << " stream named '"
@@ -526,51 +576,6 @@ bool TsnCncConfig::find_by_station_name(
         }
     }
     return false;
-}
-
-bool TsnCncConfig::report_status(
-        const TsnStream& stream,
-        EndStationStatus status)
-{
-    yang_db_item_access_t* ydbia = uniconf_handle();
-    if (nullptr == ydbia)
-    {
-        return false;
-    }
-    DbTransactionGuard release_on_exit(ydbia);
-
-    // The setters take the key fields by pointer and do not retain them.
-    StreamId stream_id = stream.stream_id;
-    const std::string mac = EthernetLocator::mac_to_string(stream.station_mac);
-
-    cc_endstation_info_t entry;
-    memset(&entry, 0, sizeof(entry));
-    entry.instIndex = instance_index_;
-    entry.cuc_id = cuc_id_.c_str();
-    entry.streamid = stream_id.data();
-    entry.lindex = stream.listener_index;
-    entry.mac_address = mac.c_str();
-    entry.interface_name = stream.interface_name.c_str();
-    entry.status = static_cast<cc_endst_status_t>(status);
-
-    const int result = stream.talker ?
-            ydbi_set_talker_status_cc(ydbia, instance_index_, cuc_id_.c_str(), &entry) :
-            ydbi_set_listener_status_cc(ydbia, instance_index_, cuc_id_.c_str(), &entry);
-
-    return 0 == result;
-}
-
-void TsnCncConfig::report_status_for_all(
-        EndStationStatus status)
-{
-    for (const TsnStream& stream : talkers())
-    {
-        report_status(stream, status);
-    }
-    for (const TsnStream& stream : listeners())
-    {
-        report_status(stream, status);
-    }
 }
 
 } // namespace tsn

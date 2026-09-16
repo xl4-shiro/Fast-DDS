@@ -55,6 +55,7 @@ bool TSNTransportDescriptor::operator ==(
            control_subtype == t.control_subtype &&
            acf_message_type == t.acf_message_type &&
            reception_timeout_ms == t.reception_timeout_ms &&
+           cnc_revocation_poll_ms == t.cnc_revocation_poll_ms &&
            PortBasedTransportDescriptor::operator ==(t);
 }
 
