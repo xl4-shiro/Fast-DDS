@@ -697,14 +697,28 @@ settles.
 
 What that costs, per decision:
 
-| Decision | To change it | Cost |
-|---|---|---|
-| Stream and control subtypes, ACF message type | `stream_subtype`, `control_subtype`, `acf_message_type` | runtime, no rebuild |
-| Default multicast MAC, VLAN, PCP | `default_multicast_mac`, `default_vlan_id`, `default_pcp` | runtime, no rebuild |
-| Framing header sizes | `TsnFraming` | one struct |
-| The 2-octet TSN-RTPS header | `TsnRtpsHeader` plus its two call sites in `AvtpStream` | one file, two uses |
-| Locator layout (Table A.1) | `EthernetLocator` | one class, public API |
-| EtherType `0x22F0` | not ours --- `avtpcon` sets it | a registered RTPS EtherType would drop the 1722 framing entirely, and with it most of this transport's reason to exist in its present shape |
+| Decision                     | To change it                   | Cost                                 |
+|------------------------------+--------------------------------+--------------------------------------|
+| Stream and control subtypes, | `stream_subtype`,              | runtime, no rebuild                  |
+| ACF message type             | `control_subtype`,             |                                      |
+|                              | `acf_message_type`             |                                      |
+|------------------------------+--------------------------------+--------------------------------------|
+| Default multicast MAC,       | `default_multicast_mac`,       | runtime, no rebuild                  |
+| VLAN, PCP                    | `default_vlan_id`,             |                                      |
+|                              | `default_pcp`                  |                                      |
+|------------------------------+--------------------------------+--------------------------------------|
+| Framing header sizes         | `TsnFraming`                   | one struct                           |
+|------------------------------+--------------------------------+--------------------------------------|
+| The 2-octet TSN-RTPS header  | `TsnRtpsHeader` plus its       | one file, two uses                   |
+|                              | two call sites in `AvtpStream` |                                      |
+|------------------------------+--------------------------------+--------------------------------------|
+| Locator layout (Table A.1)   | `EthernetLocator`              | one class, public API                |
+|------------------------------+--------------------------------+--------------------------------------|
+| EtherType `0x22F0`           | not ours ---                   | a registered RTPS EtherType would    |
+|                              | `avtpcon` sets it              | drop the 1722 framing entirely,      |
+|                              |                                | and with it most of this transport's |
+|                              |                                | reason to exist in its present shape |
+
 
 The framing sizes are worth a note. `AvtpStream` sizes its buffers per stream
 from `avtpcon_get_max_payload_size()`, which is authoritative, while
@@ -721,9 +735,12 @@ exist yet, and the field itself would become another deviation to unwind.
 
 ## References
 
-| Tag | Document |
-|---|---|
-| [DDS-TSN] | OMG, *DDS Extensions for Time Sensitive Networking*, v1.0 beta, ptc/2023-03-03 --- <https://www.omg.org/spec/DDS-TSN/1.0/Beta1/PDF> |
-| [DDSI-RTPS] | OMG, *Real-Time Publish-Subscribe Protocol DDS Interoperability Wire Protocol*, v2.5, formal/2022-04-01 |
-| [1722] | IEEE Std 1722-2025, *Standard for a Transport Protocol for Time-Sensitive Applications in Bridged Local Area Networks* |
-| [802.1Qcc] | IEEE Std 802.1Qcc-2018, and the `ieee802-dot1q-cnc-config` YANG module it defines |
+| Tag         | Document                                                                          |
+|-------------+-----------------------------------------------------------------------------------|
+| [DDS-TSN]   | OMG, *DDS Extensions for Time Sensitive Networking*,                              |
+|             | v1.0 beta, ptc/2023-03-03 --- <https://www.omg.org/spec/DDS-TSN/1.0/Beta1/PDF>    |
+| [DDSI-RTPS] | OMG, *Real-Time Publish-Subscribe Protocol DDS Interoperability Wire Protocol*,   |
+|             | v2.5, formal/2022-04-01                                                           |
+| [1722]      | IEEE Std 1722-2025, *Standard for a Transport Protocol for                        |
+|             | Time-Sensitive Applications in Bridged Local Area Networks*                       |
+| [802.1Qcc]  | IEEE Std 802.1Qcc-2018, and the `ieee802-dot1q-cnc-config` YANG module it defines |
