@@ -276,11 +276,11 @@ writes back. The transport re-reads it every `cnc_revocation_poll_ms` (default
 1000; 0 disables the check) and follows it:
 
 | `accept` | Meaning    | What the transport does                        |
-|----------+------------+------------------------------------------------|
-|        0 | init       | disconnects                                    |
-|        1 | connect    | connects, or reconnects                        |
-|        2 | disconnect | disconnects                                    |
-|        3 | deleting   | disconnects; final, the stream will not return |
+|----------|------------|------------------------------------------------|
+| 0        | init       | disconnects                                    |
+| 1        | connect    | connects, or reconnects                        |
+| 2        | disconnect | disconnects                                    |
+| 3        | deleting   | disconnects; final, the stream will not return |
 
 Each transition is logged as a warning and passed to the application through
 `on_stream_state_changed`. Nothing is written back to the datastore: `accept` is
@@ -404,13 +404,10 @@ sudo capsh --user=${USER} \
 `cnc_wait_timeout_ms` governs both modes; only the consequence of expiry
 differs:
 
-|                                   | timeout expires                                    |
-|-----------------------------------+----------------------------------------------------|
-| `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP       |
-| `allow_fallback = false`          | error; the transport does not start and            |
-|                                   | participant creation fails, or,                    |
-|                                   | for an endpoint whose topic was never provisioned, |
-|                                   | the endpoint is refused                            |
+|                                   | timeout expires                               |
+|-----------------------------------|-----------------------------------------------|
+| `allow_fallback = true` (default) | warn, carry on with the default VLAN and PCP  |
+| `allow_fallback = false`          | error; participant or endpoint creation fails |
 
 A timeout of **0 waits indefinitely**. In strict mode that means participant
 creation, and then endpoint creation, do not return until the CNC responds, and
@@ -429,7 +426,7 @@ application that does not will see an indefinite wait produce no output at all.
 specification recommends for a time-critical stream:
 
 | QoS         | Value                | Why                                                  |
-|-------------+----------------------+------------------------------------------------------|
+|-------------|----------------------|------------------------------------------------------|
 | RELIABILITY | `BEST_EFFORT`        | No acknowledgements or repairs to break the schedule |
 | DURABILITY  | `VOLATILE`           | Nothing replayed to a late joiner                    |
 | HISTORY     | `KEEP_LAST`, depth 1 | Bounded, predictable message size                    |
@@ -619,16 +616,15 @@ writers are left unlabelled so the column stays quiet for ordinary data.
 
 Useful filters:
 
-| Filter                             | Selects                                              |
-|------------------------------------+------------------------------------------------------|
-| `tsnrtps`                          | every RTPS-carrying 1722 frame                       |
-| `rtps.sm.wrEntityId == 0x000100c2` | SPDP, on either port                                 |
-| `rtps.sm.wrEntityId in             | SEDP, publications and subscriptions                 |
-| {0x000003c2, 0x000004c2}`          |                                                      |
-| `tsnrtps.dst_port == 7400`         | the metatraffic multicast channel                    |
-| `tsnrtps.stream_uid == 1`          | frames carrying a given stream ID, stream or control |
-| `ieee1722.subtype == 0x7f`         | stream framing, i.e. CNC-provisioned traffic         |
-| `ieee1722.subtype == 0x82`         | control framing, i.e. discovery and fallback         |
+| Filter                                           | Selects                                 |
+|--------------------------------------------------|-----------------------------------------|
+| `tsnrtps`                                        | every RTPS-carrying 1722 frame          |
+| `rtps.sm.wrEntityId == 0x000100c2`               | SPDP, on either port                    |
+| `rtps.sm.wrEntityId in {0x000003c2, 0x000004c2}` | SEDP, publications and subscriptions    |
+| `tsnrtps.dst_port == 7400`                       | the metatraffic multicast channel       |
+| `tsnrtps.stream_uid == 1`                        | frames on a given stream ID             |
+| `ieee1722.subtype == 0x7f`                       | stream framing: CNC-provisioned traffic |
+| `ieee1722.subtype == 0x82`                       | control framing: discovery and fallback |
 
 If the transport is configured for a different subtype or ACF message type,
 change the matching preference under *Protocols > TSNRTPS*; the dissector
@@ -697,27 +693,22 @@ settles.
 
 What that costs, per decision:
 
-| Decision                     | To change it                   | Cost                                 |
-|------------------------------+--------------------------------+--------------------------------------|
-| Stream and control subtypes, | `stream_subtype`,              | runtime, no rebuild                  |
-| ACF message type             | `control_subtype`,             |                                      |
-|                              | `acf_message_type`             |                                      |
-|------------------------------+--------------------------------+--------------------------------------|
-| Default multicast MAC,       | `default_multicast_mac`,       | runtime, no rebuild                  |
-| VLAN, PCP                    | `default_vlan_id`,             |                                      |
-|                              | `default_pcp`                  |                                      |
-|------------------------------+--------------------------------+--------------------------------------|
-| Framing header sizes         | `TsnFraming`                   | one struct                           |
-|------------------------------+--------------------------------+--------------------------------------|
-| The 2-octet TSN-RTPS header  | `TsnRtpsHeader` plus its       | one file, two uses                   |
-|                              | two call sites in `AvtpStream` |                                      |
-|------------------------------+--------------------------------+--------------------------------------|
-| Locator layout (Table A.1)   | `EthernetLocator`              | one class, public API                |
-|------------------------------+--------------------------------+--------------------------------------|
-| EtherType `0x22F0`           | not ours ---                   | a registered RTPS EtherType would    |
-|                              | `avtpcon` sets it              | drop the 1722 framing entirely,      |
-|                              |                                | and with it most of this transport's |
-|                              |                                | reason to exist in its present shape |
+- **Stream and control subtypes, ACF message type** --- `stream_subtype`,
+  `control_subtype`, `acf_message_type`. Runtime settings, no rebuild.
+
+- **Default multicast MAC, VLAN, PCP** --- `default_multicast_mac`,
+  `default_vlan_id`, `default_pcp`. Runtime settings, no rebuild.
+
+- **Framing header sizes** --- `TsnFraming`. One struct.
+
+- **The 2-octet TSN-RTPS header** --- `TsnRtpsHeader` and its two call sites in
+  `AvtpStream`. One file, two uses.
+
+- **Locator layout (Table A.1)** --- `EthernetLocator`. One class, public API.
+
+- **EtherType `0x22F0`** --- not ours, `avtpcon` sets it. A registered RTPS
+  EtherType would drop the 1722 framing entirely, and with it most of this
+  transport's reason to exist in its present shape.
 
 
 The framing sizes are worth a note. `AvtpStream` sizes its buffers per stream
@@ -735,12 +726,15 @@ exist yet, and the field itself would become another deviation to unwind.
 
 ## References
 
-| Tag         | Document                                                                          |
-|-------------+-----------------------------------------------------------------------------------|
-| [DDS-TSN]   | OMG, *DDS Extensions for Time Sensitive Networking*,                              |
-|             | v1.0 beta, ptc/2023-03-03 --- <https://www.omg.org/spec/DDS-TSN/1.0/Beta1/PDF>    |
-| [DDSI-RTPS] | OMG, *Real-Time Publish-Subscribe Protocol DDS Interoperability Wire Protocol*,   |
-|             | v2.5, formal/2022-04-01                                                           |
-| [1722]      | IEEE Std 1722-2025, *Standard for a Transport Protocol for                        |
-|             | Time-Sensitive Applications in Bridged Local Area Networks*                       |
-| [802.1Qcc]  | IEEE Std 802.1Qcc-2018, and the `ieee802-dot1q-cnc-config` YANG module it defines |
+- **[DDS-TSN]** --- OMG, *DDS Extensions for Time Sensitive Networking*,
+  v1.0 beta, ptc/2023-03-03.
+  <https://www.omg.org/spec/DDS-TSN/1.0/Beta1/PDF>
+
+- **[DDSI-RTPS]** --- OMG, *Real-Time Publish-Subscribe Protocol DDS
+  Interoperability Wire Protocol*, v2.5, formal/2022-04-01.
+
+- **[1722]** --- IEEE Std 1722-2025, *Standard for a Transport Protocol for
+  Time-Sensitive Applications in Bridged Local Area Networks*.
+
+- **[802.1Qcc]** --- IEEE Std 802.1Qcc-2018, and the
+  `ieee802-dot1q-cnc-config` YANG module it defines.
